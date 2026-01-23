@@ -211,3 +211,80 @@ export async function getWorkflowStatus(jobId) {
 
   return response.json();
 }
+
+// ============================================================================
+// SQL Server Loading API Functions
+// ============================================================================
+
+/**
+ * Preview what tables would be created from the files
+ * @param {Array} files - Array of file objects with filename and s3_key
+ * @returns {Promise} Preview of tables to be created
+ */
+export async function previewSqlLoad(files) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/preview-load`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ files })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to preview SQL load');
+  }
+
+  return response.json();
+}
+
+/**
+ * Load files to SQL Server
+ * @param {Array} files - Array of file objects with filename and s3_key
+ * @param {boolean} dropExisting - Whether to drop existing tables (default: true)
+ * @returns {Promise} Load results
+ */
+export async function loadToSql(files, dropExisting = true) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/load-to-sql`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ files, drop_existing: dropExisting })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to load to SQL Server');
+  }
+
+  return response.json();
+}
+
+// ============================================================================
+// Integrated Validation Workflow
+// ============================================================================
+
+/**
+ * Run the integrated validation workflow
+ * Steps: 1. Check duplicates (auto-move) 2. Validate names 3. Check completeness
+ *        4. Generate report if errors 5. Load to SQL if no errors
+ * @param {boolean} loadToSqlFlag - Whether to load to SQL if all checks pass
+ * @returns {Promise} Workflow results with step details and report URL if errors
+ */
+export async function runValidationWorkflow(loadToSqlFlag = false) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/run-workflow`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ load_to_sql: loadToSqlFlag })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to run validation workflow');
+  }
+
+  return response.json();
+}
