@@ -21,11 +21,11 @@ const awsconfig = {
       }
     }
   },
-  // API Gateway configuration - Update after deploying backend infrastructure
+  // API Gateway configuration - Hacienda Validation API
   API: {
     REST: {
       'haciendaApi': {
-        endpoint: 'https://placeholder.execute-api.us-east-1.amazonaws.com/prod',
+        endpoint: 'https://oibtjhhyma.execute-api.us-east-1.amazonaws.com/prod',
         region: 'us-east-1'
       }
     }

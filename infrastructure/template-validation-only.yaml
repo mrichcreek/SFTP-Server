@@ -1,0 +1,212 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hacienda File Validation API (No VPC Required)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+
+  CognitoUserPoolId:
+    Type: String
+    Description: Existing Cognito User Pool ID
+    Default: us-east-1_B9L2aprTj
+
+  CognitoUserPoolArn:
+    Type: String
+    Description: Existing Cognito User Pool ARN
+    Default: arn:aws:cognito-idp:us-east-1:087243890715:userpool/us-east-1_B9L2aprTj
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.10
+    MemorySize: 512
+
+Resources:
+  # S3 Bucket for downloaded files
+  DownloadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hacienda-sftp-downloads-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB table for tracking jobs
+  JobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'hacienda-sftp-download-jobs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Lambda execution role (no VPC)
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hacienda-validation-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ValidationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !GetAtt DownloadsBucket.Arn
+                  - !Sub '${DownloadsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt JobsTable.Arn
+
+  # Lambda function for file name validation
+  ValidateFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-validate-files-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.validate_files_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref JobsTable
+      Events:
+        ValidateFiles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /validate
+            Method: POST
+
+  # Lambda function for completeness checking
+  CheckCompletenessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-check-completeness-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.check_completeness_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref JobsTable
+      Events:
+        CheckCompleteness:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /completeness
+            Method: POST
+
+  # Lambda function for duplicate detection
+  CheckDuplicatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-check-duplicates-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.check_duplicates_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref JobsTable
+      Events:
+        CheckDuplicates:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /duplicates
+            Method: POST
+
+  # Lambda function for listing files
+  ListFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-list-files-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.list_files_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        ListFiles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /files
+            Method: GET
+
+  # API Gateway with Cognito Authorizer
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'hacienda-validation-api-${Environment}'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Ref CognitoUserPoolArn
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+
+  S3BucketName:
+    Description: S3 bucket for files
+    Value: !Ref DownloadsBucket
+
+  ValidateFunctionArn:
+    Description: Validate files Lambda ARN
+    Value: !GetAtt ValidateFilesFunction.Arn

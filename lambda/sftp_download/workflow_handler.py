@@ -657,6 +657,54 @@ def get_workflow_status(event, context):
 
 
 # ============================================================================
+# API GATEWAY HANDLERS (parse body from API Gateway events)
+# ============================================================================
+
+def parse_api_event(event):
+    """Parse body from API Gateway event."""
+    if event.get('body'):
+        try:
+            return json.loads(event['body'])
+        except (json.JSONDecodeError, TypeError):
+            return {}
+    return event
+
+
+def validate_files_handler(event, context):
+    """API Gateway handler for file validation."""
+    parsed_event = parse_api_event(event)
+    return validate_files_step(parsed_event, context)
+
+
+def check_completeness_handler(event, context):
+    """API Gateway handler for completeness checking."""
+    parsed_event = parse_api_event(event)
+    return check_completeness_step(parsed_event, context)
+
+
+def check_duplicates_handler(event, context):
+    """API Gateway handler for duplicate detection."""
+    parsed_event = parse_api_event(event)
+    return check_duplicates_step(parsed_event, context)
+
+
+def list_files_handler(event, context):
+    """API Gateway handler for listing files in S3."""
+    parsed_event = parse_api_event(event)
+    bucket = parsed_event.get("bucket", S3_BUCKET)
+    prefix = parsed_event.get("prefix", "")
+
+    try:
+        files = list_s3_files(bucket, prefix)
+        return format_response(200, {
+            "total_files": len(files),
+            "files": files
+        })
+    except Exception as e:
+        return format_response(500, {"error": str(e)})
+
+
+# ============================================================================
 # MAIN ROUTER
 # ============================================================================
 
