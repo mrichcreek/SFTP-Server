@@ -1,13 +1,15 @@
 import React, { useState } from 'react';
-import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus } from '../services/api';
+import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus, listFiles, previewSqlLoad, loadToSql, runValidationWorkflow } from '../services/api';
 
 const ValidationPanel = () => {
-  const [activeTab, setActiveTab] = useState('validate');
+  const [activeTab, setActiveTab] = useState('duplicates');
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
   const [workflowJobId, setWorkflowJobId] = useState(null);
   const [workflowStatus, setWorkflowStatus] = useState(null);
+  const [sqlPreview, setSqlPreview] = useState(null);
+  const [sqlLoading, setSqlLoading] = useState(false);
 
   // Validate file names
   const handleValidate = async () => {
@@ -88,6 +90,74 @@ const ValidationPanel = () => {
       }
     } catch (err) {
       console.error('Error polling status:', err);
+    }
+  };
+
+  // Run integrated validation workflow
+  const handleIntegratedWorkflow = async (loadToSql = false) => {
+    setLoading(true);
+    setError(null);
+    setResults(null);
+    try {
+      const result = await runValidationWorkflow(loadToSql);
+      setResults({ type: 'integratedWorkflow', data: result });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Preview SQL load
+  const handlePreviewSqlLoad = async () => {
+    setLoading(true);
+    setError(null);
+    setSqlPreview(null);
+    setResults(null);
+    try {
+      // First get all files from S3
+      const filesResult = await listFiles();
+      const files = filesResult.files || [];
+
+      // Transform to expected format
+      const fileList = files.map(f => ({
+        filename: f.filename || f.key?.split('/').pop(),
+        s3_key: f.key || f.s3_key
+      }));
+
+      // Get preview
+      const preview = await previewSqlLoad(fileList);
+      setSqlPreview(preview);
+      setResults({ type: 'sqlpreview', data: preview });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Load to SQL Server
+  const handleLoadToSql = async () => {
+    if (!sqlPreview || !sqlPreview.tables) {
+      setError('Please preview the load first');
+      return;
+    }
+
+    setSqlLoading(true);
+    setError(null);
+    try {
+      // Get the files from the preview
+      const files = sqlPreview.tables.map(t => ({
+        filename: t.source_file,
+        s3_key: t.s3_key
+      }));
+
+      const result = await loadToSql(files, true);
+      setResults({ type: 'sqlload', data: result });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSqlLoading(false);
     }
   };
 
@@ -334,6 +404,251 @@ const ValidationPanel = () => {
     </div>
   );
 
+  const renderSqlPreviewResults = (data) => (
+    <div style={styles.resultSection}>
+      <h4 style={styles.resultTitle}>SQL Load Preview</h4>
+      <div style={styles.statsGrid}>
+        <div style={styles.statBox}>
+          <span style={styles.statNumber}>{data.total_tables}</span>
+          <span style={styles.statLabel}>Tables to Create</span>
+        </div>
+      </div>
+
+      <p style={styles.sectionDescription}>
+        The following tables will be created in SQL Server. Each table contains the newest version of the file.
+      </p>
+
+      <div style={styles.tableList}>
+        {data.tables && data.tables.map((table, idx) => (
+          <div key={idx} style={styles.tableItem}>
+            <div style={styles.tableName}>{table.table_name}</div>
+            <div style={styles.tableSource}>
+              Source: {table.source_file}
+            </div>
+            <div style={styles.tableDate}>
+              Date: {table.date_portion}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={styles.loadButtonContainer}>
+        <button
+          style={{ ...styles.actionButton, backgroundColor: '#28a745' }}
+          onClick={handleLoadToSql}
+          disabled={sqlLoading}
+        >
+          {sqlLoading ? 'Loading to SQL Server...' : 'Load to SQL Server'}
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderSqlLoadResults = (data) => (
+    <div style={styles.resultSection}>
+      <h4 style={styles.resultTitle}>SQL Load Results</h4>
+      <div style={styles.statsGrid}>
+        <div style={styles.statBox}>
+          <span style={styles.statNumber}>{data.total_tables}</span>
+          <span style={styles.statLabel}>Total Tables</span>
+        </div>
+        <div style={{ ...styles.statBox, backgroundColor: '#d4edda' }}>
+          <span style={styles.statNumber}>{data.successful}</span>
+          <span style={styles.statLabel}>Successful</span>
+        </div>
+        <div style={{ ...styles.statBox, backgroundColor: data.failed > 0 ? '#f8d7da' : '#d4edda' }}>
+          <span style={styles.statNumber}>{data.failed}</span>
+          <span style={styles.statLabel}>Failed</span>
+        </div>
+      </div>
+
+      <div style={styles.tableList}>
+        {data.tables && data.tables.map((table, idx) => (
+          <div key={idx} style={{
+            ...styles.tableItem,
+            borderLeft: `4px solid ${table.success ? '#28a745' : '#dc3545'}`
+          }}>
+            <div style={styles.tableName}>
+              {table.success ? '✓' : '✗'} {table.table_name}
+            </div>
+            <div style={styles.tableSource}>
+              Source: {table.source_file}
+            </div>
+            {table.success ? (
+              <div style={styles.rowsLoaded}>
+                Rows loaded: {table.rows_loaded} | Columns: {table.columns}
+              </div>
+            ) : (
+              <div style={styles.loadError}>
+                Error: {table.error}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+
+  const renderIntegratedWorkflowResults = (data) => (
+    <div style={styles.resultSection}>
+      <h4 style={styles.resultTitle}>Validation Workflow Results</h4>
+
+      {/* Overall Status */}
+      <div style={{
+        ...styles.statusBanner,
+        backgroundColor: data.has_errors ? '#f8d7da' : data.status === 'completed' ? '#d4edda' : '#fff3cd'
+      }}>
+        <strong>Status: </strong>
+        {data.has_errors ? 'Errors Found - Review Report' :
+          data.status === 'completed' ? 'All Checks Passed' : data.status}
+      </div>
+
+      {/* Step Results */}
+      <div style={styles.stepsList}>
+        {/* Step 1: Initial Files */}
+        {data.steps?.initial_files && (
+          <div style={styles.stepBox}>
+            <div style={styles.stepHeader}>Step 1: List Files</div>
+            <div style={styles.stepDetail}>
+              Total files found: {data.steps.initial_files.total_files}
+            </div>
+          </div>
+        )}
+
+        {/* Step 2: Duplicates */}
+        {data.steps?.duplicates && (
+          <div style={{
+            ...styles.stepBox,
+            borderLeft: `4px solid ${data.steps.duplicates.total_moved > 0 ? '#ffc107' : '#28a745'}`
+          }}>
+            <div style={styles.stepHeader}>Step 2: Duplicate Check</div>
+            <div style={styles.stepDetail}>
+              Exact duplicates moved: {data.steps.duplicates.exact_duplicates_moved}
+            </div>
+            <div style={styles.stepDetail}>
+              Older versions moved: {data.steps.duplicates.superseded_moved}
+            </div>
+            <div style={styles.stepDetail}>
+              Files remaining: {data.steps.duplicates.files_remaining}
+            </div>
+            {data.steps.duplicates.total_moved > 0 && (
+              <div style={styles.stepNote}>
+                Files moved to DuplicateCheck/ folder
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step 3: Validation */}
+        {data.steps?.validation && (
+          <div style={{
+            ...styles.stepBox,
+            borderLeft: `4px solid ${data.steps.validation.status === 'passed' ? '#28a745' : '#dc3545'}`
+          }}>
+            <div style={styles.stepHeader}>Step 3: File Name Validation</div>
+            <div style={styles.stepDetail}>
+              Valid: {data.steps.validation.valid_count} | Invalid: {data.steps.validation.invalid_count}
+            </div>
+            {data.steps.validation.invalid_files?.length > 0 && (
+              <div style={styles.invalidList}>
+                <strong>Invalid files:</strong>
+                {data.steps.validation.invalid_files.slice(0, 5).map((f, i) => (
+                  <div key={i} style={styles.invalidItem}>
+                    {f.file_name}: {f.error_message}
+                  </div>
+                ))}
+                {data.steps.validation.invalid_files.length > 5 && (
+                  <div style={styles.moreItems}>...and {data.steps.validation.invalid_files.length - 5} more</div>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Step 4: Completeness */}
+        {data.steps?.completeness && (
+          <div style={{
+            ...styles.stepBox,
+            borderLeft: `4px solid ${data.steps.completeness.status === 'passed' ? '#28a745' : '#dc3545'}`
+          }}>
+            <div style={styles.stepHeader}>Step 4: Completeness Check</div>
+            <div style={styles.stepDetail}>
+              Complete sets: {data.steps.completeness.complete_sets} |
+              Incomplete: {data.steps.completeness.incomplete_sets} |
+              {data.steps.completeness.completeness_percentage}%
+            </div>
+          </div>
+        )}
+
+        {/* Step 5: Report (if errors) */}
+        {data.steps?.report && (
+          <div style={{ ...styles.stepBox, borderLeft: '4px solid #17a2b8' }}>
+            <div style={styles.stepHeader}>Step 5: Error Report Generated</div>
+            <a
+              href={data.report_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={styles.downloadLink}
+            >
+              Download Report ({data.report_name})
+            </a>
+          </div>
+        )}
+
+        {/* Step 6: SQL Load (if no errors) */}
+        {data.steps?.sql_load && data.steps.sql_load.status !== 'skipped' && (
+          <div style={{
+            ...styles.stepBox,
+            borderLeft: `4px solid ${data.steps.sql_load.status === 'completed' ? '#28a745' : '#dc3545'}`
+          }}>
+            <div style={styles.stepHeader}>Step 6: SQL Server Load</div>
+            <div style={styles.stepDetail}>
+              Tables: {data.steps.sql_load.total_tables} |
+              Successful: {data.steps.sql_load.successful} |
+              Failed: {data.steps.sql_load.failed}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Download Report Button */}
+      {data.report_url && (
+        <div style={styles.reportSection}>
+          <button
+            style={styles.downloadButton}
+            onClick={() => {
+              const link = document.createElement('a');
+              link.href = data.report_url;
+              link.download = data.report_name || 'validation_report.csv';
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+            }}
+          >
+            <span style={styles.downloadIcon}>&#8681;</span>
+            Download Error Report (CSV)
+          </button>
+          <div style={styles.reportFileName}>
+            {data.report_name}
+          </div>
+        </div>
+      )}
+
+      {/* Load to SQL Button (if no errors and not yet loaded) */}
+      {!data.has_errors && data.steps?.sql_load?.status === 'skipped' && (
+        <div style={styles.loadButtonContainer}>
+          <button
+            style={{ ...styles.actionButton, backgroundColor: '#28a745' }}
+            onClick={() => handleIntegratedWorkflow(true)}
+            disabled={loading}
+          >
+            All Checks Passed - Load to SQL Server
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   const renderResults = () => {
     if (!results) return null;
 
@@ -346,6 +661,12 @@ const ValidationPanel = () => {
         return renderDuplicatesResults(results.data);
       case 'workflow':
         return renderWorkflowResults(results.data);
+      case 'integratedWorkflow':
+        return renderIntegratedWorkflowResults(results.data);
+      case 'sqlpreview':
+        return renderSqlPreviewResults(results.data);
+      case 'sqlload':
+        return renderSqlLoadResults(results.data);
       default:
         return <pre>{JSON.stringify(results.data, null, 2)}</pre>;
     }
@@ -354,6 +675,12 @@ const ValidationPanel = () => {
   return (
     <div style={styles.container}>
       <div style={styles.tabs}>
+        <button
+          style={activeTab === 'duplicates' ? styles.activeTab : styles.tab}
+          onClick={() => setActiveTab('duplicates')}
+        >
+          Find Duplicates
+        </button>
         <button
           style={activeTab === 'validate' ? styles.activeTab : styles.tab}
           onClick={() => setActiveTab('validate')}
@@ -367,20 +694,36 @@ const ValidationPanel = () => {
           Check Completeness
         </button>
         <button
-          style={activeTab === 'duplicates' ? styles.activeTab : styles.tab}
-          onClick={() => setActiveTab('duplicates')}
-        >
-          Find Duplicates
-        </button>
-        <button
           style={activeTab === 'workflow' ? styles.activeTab : styles.tab}
           onClick={() => setActiveTab('workflow')}
         >
           Full Workflow
         </button>
+        <button
+          style={activeTab === 'sqlload' ? styles.activeTab : styles.tab}
+          onClick={() => setActiveTab('sqlload')}
+        >
+          Load to SQL
+        </button>
       </div>
 
       <div style={styles.content}>
+        {activeTab === 'duplicates' && (
+          <div style={styles.section}>
+            <p style={styles.description}>
+              Detect duplicate files in the S3 bucket. Identifies files with identical content
+              and recommends which ones to keep.
+            </p>
+            <button
+              style={styles.actionButton}
+              onClick={handleCheckDuplicates}
+              disabled={loading}
+            >
+              {loading ? 'Checking...' : 'Find Duplicates'}
+            </button>
+          </div>
+        )}
+
         {activeTab === 'validate' && (
           <div style={styles.section}>
             <p style={styles.description}>
@@ -414,38 +757,41 @@ const ValidationPanel = () => {
           </div>
         )}
 
-        {activeTab === 'duplicates' && (
+        {activeTab === 'workflow' && (
           <div style={styles.section}>
             <p style={styles.description}>
-              Detect duplicate files in the S3 bucket. Identifies files with identical content
-              and recommends which ones to keep.
+              Run the integrated validation workflow:
             </p>
+            <ol style={styles.workflowSteps}>
+              <li>Check for duplicates and older versions - automatically move to DuplicateCheck/ folder</li>
+              <li>Validate file names against naming conventions</li>
+              <li>Check completeness - each source must have all 8 entity types</li>
+              <li>If errors found: generate downloadable report</li>
+              <li>If all checks pass: option to load to SQL Server</li>
+            </ol>
             <button
-              style={styles.actionButton}
-              onClick={handleCheckDuplicates}
+              style={{ ...styles.actionButton, backgroundColor: '#28a745' }}
+              onClick={() => handleIntegratedWorkflow(false)}
               disabled={loading}
             >
-              {loading ? 'Checking...' : 'Find Duplicates'}
+              {loading ? 'Running Validation...' : 'Run Validation Workflow'}
             </button>
           </div>
         )}
 
-        {activeTab === 'workflow' && (
+        {activeTab === 'sqlload' && (
           <div style={styles.section}>
             <p style={styles.description}>
-              Run the complete validation and loading workflow:
-              1. Check for duplicates
-              2. Validate file names
-              3. Check completeness
-              4. Load to database
-              5. Execute HCM interface
+              Load the newest version of each file type to SQL Server tables.
+              Tables will be created with column names matching the CSV headers.
+              Only the newest file for each type (e.g., HCM_PERSON_ADDRESS_INTF_FIMAS) will be loaded.
             </p>
             <button
-              style={{ ...styles.actionButton, backgroundColor: '#28a745' }}
-              onClick={handleRunWorkflow}
+              style={styles.actionButton}
+              onClick={handlePreviewSqlLoad}
               disabled={loading}
             >
-              {loading ? 'Running Workflow...' : 'Run Complete Workflow'}
+              {loading ? 'Analyzing Files...' : 'Preview SQL Load'}
             </button>
           </div>
         )}
@@ -747,6 +1093,132 @@ const styles = {
     color: '#dc3545',
     fontSize: '13px',
     marginTop: '4px'
+  },
+  tableList: {
+    marginTop: '16px'
+  },
+  tableItem: {
+    padding: '12px',
+    backgroundColor: '#fff',
+    borderRadius: '6px',
+    marginBottom: '8px',
+    borderLeft: '4px solid #007bff'
+  },
+  tableName: {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    color: '#232f3e'
+  },
+  tableSource: {
+    fontSize: '12px',
+    color: '#666',
+    marginTop: '4px'
+  },
+  tableDate: {
+    fontSize: '12px',
+    color: '#888',
+    marginTop: '2px'
+  },
+  rowsLoaded: {
+    fontSize: '12px',
+    color: '#28a745',
+    marginTop: '4px'
+  },
+  loadError: {
+    fontSize: '12px',
+    color: '#dc3545',
+    marginTop: '4px'
+  },
+  loadButtonContainer: {
+    marginTop: '20px',
+    textAlign: 'center'
+  },
+  workflowSteps: {
+    marginBottom: '16px',
+    paddingLeft: '20px',
+    lineHeight: '1.8'
+  },
+  statusBanner: {
+    padding: '16px',
+    borderRadius: '8px',
+    marginBottom: '20px',
+    textAlign: 'center',
+    fontSize: '16px'
+  },
+  stepsList: {
+    marginTop: '16px'
+  },
+  stepBox: {
+    padding: '16px',
+    backgroundColor: '#fff',
+    borderRadius: '8px',
+    marginBottom: '12px',
+    borderLeft: '4px solid #28a745'
+  },
+  stepHeader: {
+    fontWeight: 'bold',
+    marginBottom: '8px',
+    color: '#232f3e'
+  },
+  stepDetail: {
+    fontSize: '13px',
+    color: '#666',
+    marginBottom: '4px'
+  },
+  stepNote: {
+    fontSize: '12px',
+    color: '#856404',
+    fontStyle: 'italic',
+    marginTop: '8px'
+  },
+  invalidList: {
+    marginTop: '8px',
+    fontSize: '12px'
+  },
+  invalidItem: {
+    color: '#dc3545',
+    marginLeft: '12px',
+    marginTop: '4px'
+  },
+  downloadLink: {
+    color: '#007bff',
+    textDecoration: 'underline'
+  },
+  reportSection: {
+    marginTop: '20px',
+    textAlign: 'center'
+  },
+  reportButton: {
+    display: 'inline-block',
+    padding: '12px 24px',
+    backgroundColor: '#17a2b8',
+    color: 'white',
+    textDecoration: 'none',
+    borderRadius: '6px',
+    fontWeight: 'bold'
+  },
+  downloadButton: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: '10px',
+    padding: '14px 28px',
+    backgroundColor: '#dc3545',
+    color: 'white',
+    border: 'none',
+    borderRadius: '8px',
+    fontSize: '16px',
+    fontWeight: 'bold',
+    cursor: 'pointer',
+    boxShadow: '0 2px 4px rgba(0,0,0,0.2)'
+  },
+  downloadIcon: {
+    fontSize: '20px',
+    fontWeight: 'bold'
+  },
+  reportFileName: {
+    marginTop: '8px',
+    fontSize: '12px',
+    color: '#666'
   }
 };
 
