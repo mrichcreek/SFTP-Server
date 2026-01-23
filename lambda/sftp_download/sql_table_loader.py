@@ -296,23 +296,28 @@ def load_file_to_sql(
     bucket: str,
     s3_key: str,
     table_name: str,
-    drop_existing: bool = True
+    clear_existing: bool = True
 ) -> Dict:
     """
-    Load a single CSV file from S3 into a SQL Server table.
+    Load a single CSV file from S3 into an existing SQL Server table.
+
+    NOTE: Tables must already exist in the database. This function does NOT
+    create tables - it only clears existing data and inserts new rows.
 
     Args:
         s3_client: Boto3 S3 client
         connection_string: Connection string (ODBC format, will be parsed)
         bucket: S3 bucket name
         s3_key: S3 object key
-        table_name: Name for the SQL table
-        drop_existing: Whether to drop existing table
+        table_name: Name of the existing SQL table
+        clear_existing: Whether to clear existing data before inserting
 
     Returns:
         Dict with load results
     """
     import pymssql
+
+    safe_table_name = sanitize_column_name(table_name)
 
     result = {
         'table_name': table_name,
@@ -342,13 +347,15 @@ def load_file_to_sql(
         ) as conn:
             cursor = conn.cursor()
 
-            # Create table
-            create_sql = generate_create_table_sql(table_name, headers, drop_existing)
-            for statement in create_sql.split(';'):
-                statement = statement.strip()
-                if statement:
-                    cursor.execute(statement)
-            conn.commit()
+            # Clear existing data if requested (don't drop/create - tables already exist)
+            if clear_existing:
+                try:
+                    # Try TRUNCATE first (faster, but requires ALTER permission)
+                    cursor.execute(f"TRUNCATE TABLE dbo.[{safe_table_name}]")
+                except Exception:
+                    # Fall back to DELETE if TRUNCATE fails (requires only DELETE permission)
+                    cursor.execute(f"DELETE FROM dbo.[{safe_table_name}]")
+                conn.commit()
 
             # Insert data in batches
             if rows:
@@ -373,16 +380,19 @@ def load_all_newest_files(
     bucket: str,
     files: List[Dict],
     secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
-    drop_existing: bool = True
+    clear_existing: bool = True
 ) -> Dict:
     """
-    Load all newest version files into SQL Server tables.
+    Load all newest version files into existing SQL Server tables.
+
+    NOTE: Tables must already exist in the database. This function does NOT
+    create tables - it only clears existing data and inserts new rows.
 
     Args:
         bucket: S3 bucket name
         files: List of file info dicts
         secret_name: Name of AWS secret containing connection string
-        drop_existing: Whether to drop existing tables
+        clear_existing: Whether to clear existing data before inserting
 
     Returns:
         Dict with overall results and per-table results
@@ -411,7 +421,7 @@ def load_all_newest_files(
             bucket=bucket,
             s3_key=s3_key,
             table_name=table_name,
-            drop_existing=drop_existing
+            clear_existing=clear_existing
         )
 
         load_result['source_file'] = file_info.get('filename', '')
@@ -452,7 +462,7 @@ def load_to_sql_handler(event, context):
 
         files = body.get('files', [])
         bucket = body.get('bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
-        drop_existing = body.get('drop_existing', True)
+        clear_existing = body.get('clear_existing', True)
 
         if not files:
             return {
@@ -464,11 +474,11 @@ def load_to_sql_handler(event, context):
                 'body': json.dumps({'error': 'No files provided'})
             }
 
-        # Load files to SQL
+        # Load files to SQL (tables must already exist in database)
         results = load_all_newest_files(
             bucket=bucket,
             files=files,
-            drop_existing=drop_existing
+            clear_existing=clear_existing
         )
 
         return {
