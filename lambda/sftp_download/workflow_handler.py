@@ -20,29 +20,73 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from decimal import Decimal
 
-# Add parent directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Initialize AWS clients directly (for Lambda deployment)
+s3_client = boto3.client('s3')
+dynamodb = boto3.resource('dynamodb')
 
-# Import existing handler functions
-from handler import (
-    s3_client, dynamodb, S3_BUCKET, JOBS_TABLE,
-    get_sftp_credentials, create_sftp_connection,
-    list_remote_files, download_file_to_s3
-)
+# Environment variables
+S3_BUCKET = os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
+JOBS_TABLE = os.environ.get('JOBS_TABLE', 'hacienda-sftp-download-jobs-prod')
 
-# Import validation modules
+# Add the Lambda task root to path for imports
+# In Lambda, the code is at /var/task/
+lambda_root = os.environ.get('LAMBDA_TASK_ROOT', os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if lambda_root not in sys.path:
+    sys.path.insert(0, lambda_root)
+
+# Import validation modules - required for validation features
+# Use fully qualified paths that work in Lambda environment
+import importlib.util
+def import_from_file(module_name, file_path):
+    """Import a module from a specific file path."""
+    spec = importlib.util.spec_from_file_location(module_name, file_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+# Determine the base path for imports
+if os.environ.get('LAMBDA_TASK_ROOT'):
+    base_path = os.environ['LAMBDA_TASK_ROOT']
+else:
+    base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# Import validation modules using explicit file paths
+_validator_module = import_from_file('file_naming_validator',
+    os.path.join(base_path, 'file_validation', 'file_naming_validator.py'))
+validate_file_list = _validator_module.validate_file_list
+validate_file_name = _validator_module.validate_file_name
+VALID_SOURCES = _validator_module.VALID_SOURCES
+VALID_ENTITIES = _validator_module.VALID_ENTITIES
+
+_completeness_module = import_from_file('completeness_checker',
+    os.path.join(base_path, 'file_validation', 'completeness_checker.py'))
+check_completeness = _completeness_module.check_completeness
+get_missing_files_report = _completeness_module.get_missing_files_report
+
+_duplicate_module = import_from_file('duplicate_detector',
+    os.path.join(base_path, 'file_validation', 'duplicate_detector.py'))
+find_exact_duplicates_s3 = _duplicate_module.find_exact_duplicates_s3
+check_file_exists_in_s3 = _duplicate_module.check_file_exists_in_s3
+
+# Try to import from handler for SFTP functions (optional, not needed for validation)
 try:
-    from file_validation.file_naming_validator import validate_file_list, validate_file_name, VALID_SOURCES, VALID_ENTITIES
-    from file_validation.completeness_checker import check_completeness, get_missing_files_report
-    from file_validation.duplicate_detector import find_exact_duplicates_s3, check_file_exists_in_s3
+    from sftp_download.handler import (
+        get_sftp_credentials, create_sftp_connection,
+        list_remote_files, download_file_to_s3
+    )
 except ImportError:
-    # If running standalone, these will need to be in the Lambda package
-    pass
+    # SFTP functions not available - validation features will still work
+    get_sftp_credentials = None
+    create_sftp_connection = None
+    list_remote_files = None
+    download_file_to_s3 = None
 
+# Try to import database loader (optional, requires VPC)
 try:
     from data_loader.database_loader import load_multiple_files, execute_hcm_main_interface
 except ImportError:
-    pass
+    load_multiple_files = None
+    execute_hcm_main_interface = None
 
 
 def json_serial(obj):
@@ -270,19 +314,45 @@ def check_duplicates_step(event, context):
         "bucket": "bucket-name",
         "prefix": "optional/prefix/"
     }
+
+    Returns:
+    - exact_duplicate_groups: Files with identical content (same hash)
+    - superseded_groups: Files of same type but different dates (keep newest)
     """
     bucket = event.get("bucket", S3_BUCKET)
     prefix = event.get("prefix", "")
 
-    result = find_exact_duplicates_s3(bucket, prefix, s3_client)
+    result = find_exact_duplicates_s3(bucket, prefix, s3_client, include_superseded=True)
 
-    groups_json = []
+    # Exact duplicates (same content/hash)
+    exact_groups_json = []
     for group in result.groups:
-        groups_json.append({
+        exact_groups_json.append({
             "key": group.key,
             "files": group.files,
-            "recommended_keep": group.recommended_keep
+            "recommended_keep": group.recommended_keep,
+            "type": "exact_duplicate"
         })
+
+    # Superseded files (same type, older dates)
+    superseded_json = []
+    if result.superseded_groups:
+        for group in result.superseded_groups:
+            # Clean up internal fields before returning
+            clean_files = []
+            for f in group.files:
+                clean_file = {k: v for k, v in f.items() if not k.startswith('_')}
+                clean_file['date'] = f.get('_date_portion', '')
+                clean_files.append(clean_file)
+
+            superseded_json.append({
+                "file_type": group.file_type,
+                "entity": group.entity,
+                "files": clean_files,
+                "recommended_keep": group.recommended_keep,
+                "superseded_files": group.superseded_files,
+                "type": "superseded"
+            })
 
     return {
         'statusCode': 200,
@@ -293,11 +363,14 @@ def check_duplicates_step(event, context):
         'body': json.dumps({
             "total_files": result.total_files,
             "unique_files": result.unique_files,
-            "duplicate_groups": result.duplicate_groups,
-            "total_duplicates": result.total_duplicates,
+            "exact_duplicate_groups": len(exact_groups_json),
+            "total_exact_duplicates": result.total_duplicates,
+            "superseded_groups_count": len(superseded_json),
+            "total_superseded": result.total_superseded,
             "storage_waste_bytes": result.storage_waste_bytes,
             "storage_waste_mb": round(result.storage_waste_bytes / 1024 / 1024, 2),
-            "groups": groups_json
+            "exact_duplicates": exact_groups_json,
+            "superseded": superseded_json
         })
     }
 

@@ -7,6 +7,11 @@ Parameters:
     Type: String
     Default: prod
 
+  S3BucketName:
+    Type: String
+    Default: hacienda-sftp-downloads
+    Description: Existing S3 bucket for downloaded files
+
   CognitoUserPoolId:
     Type: String
     Description: Existing Cognito User Pool ID
@@ -24,34 +29,6 @@ Globals:
     MemorySize: 512
 
 Resources:
-  # S3 Bucket for downloaded files
-  DownloadsBucket:
-    Type: AWS::S3::Bucket
-    Properties:
-      BucketName: !Sub 'hacienda-sftp-downloads-${AWS::AccountId}'
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      VersioningConfiguration:
-        Status: Enabled
-      CorsConfiguration:
-        CorsRules:
-          - AllowedHeaders:
-              - '*'
-            AllowedMethods:
-              - GET
-              - PUT
-              - POST
-            AllowedOrigins:
-              - '*'
-            MaxAge: 3000
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-
   # DynamoDB table for tracking jobs
   JobsTable:
     Type: AWS::DynamoDB::Table
@@ -93,8 +70,8 @@ Resources:
                   - s3:ListBucket
                   - s3:HeadObject
                 Resource:
-                  - !GetAtt DownloadsBucket.Arn
-                  - !Sub '${DownloadsBucket.Arn}/*'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -113,7 +90,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          S3_BUCKET: !Ref DownloadsBucket
+          S3_BUCKET: !Ref S3BucketName
           JOBS_TABLE: !Ref JobsTable
       Events:
         ValidateFiles:
@@ -133,7 +110,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          S3_BUCKET: !Ref DownloadsBucket
+          S3_BUCKET: !Ref S3BucketName
           JOBS_TABLE: !Ref JobsTable
       Events:
         CheckCompleteness:
@@ -153,7 +130,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          S3_BUCKET: !Ref DownloadsBucket
+          S3_BUCKET: !Ref S3BucketName
           JOBS_TABLE: !Ref JobsTable
       Events:
         CheckDuplicates:
@@ -173,7 +150,7 @@ Resources:
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          S3_BUCKET: !Ref DownloadsBucket
+          S3_BUCKET: !Ref S3BucketName
       Events:
         ListFiles:
           Type: Api
@@ -192,8 +169,29 @@ Resources:
         AllowMethods: "'GET,POST,OPTIONS'"
         AllowHeaders: "'Content-Type,Authorization'"
         AllowOrigin: "'*'"
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        DEFAULT_4XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        DEFAULT_5XX:
+          ResponseParameters:
+            Headers:
+              Access-Control-Allow-Origin: "'*'"
+              Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
       Auth:
         DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CognitoAuthorizer:
             UserPoolArn: !Ref CognitoUserPoolArn
@@ -205,7 +203,7 @@ Outputs:
 
   S3BucketName:
     Description: S3 bucket for files
-    Value: !Ref DownloadsBucket
+    Value: !Ref S3BucketName
 
   ValidateFunctionArn:
     Description: Validate files Lambda ARN

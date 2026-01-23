@@ -197,33 +197,98 @@ const ValidationPanel = () => {
           <span style={styles.statNumber}>{data.unique_files}</span>
           <span style={styles.statLabel}>Unique Files</span>
         </div>
-        <div style={{ ...styles.statBox, backgroundColor: data.total_duplicates > 0 ? '#f8d7da' : '#d4edda' }}>
-          <span style={styles.statNumber}>{data.total_duplicates}</span>
-          <span style={styles.statLabel}>Duplicates</span>
+        <div style={{ ...styles.statBox, backgroundColor: data.total_exact_duplicates > 0 ? '#f8d7da' : '#d4edda' }}>
+          <span style={styles.statNumber}>{data.total_exact_duplicates || 0}</span>
+          <span style={styles.statLabel}>Exact Duplicates</span>
         </div>
-        <div style={styles.statBox}>
-          <span style={styles.statNumber}>{data.storage_waste_mb} MB</span>
-          <span style={styles.statLabel}>Wasted Storage</span>
+        <div style={{ ...styles.statBox, backgroundColor: data.total_superseded > 0 ? '#fff3cd' : '#d4edda' }}>
+          <span style={styles.statNumber}>{data.total_superseded || 0}</span>
+          <span style={styles.statLabel}>Older Versions</span>
         </div>
       </div>
 
-      {data.groups && data.groups.length > 0 && (
-        <div style={styles.duplicateGroups}>
-          <h5>Duplicate Groups:</h5>
-          {data.groups.slice(0, 5).map((group, idx) => (
+      <div style={styles.storageInfo}>
+        <strong>Potential Storage Savings:</strong> {data.storage_waste_mb} MB
+      </div>
+
+      {/* Exact Duplicates Section */}
+      {data.exact_duplicates && data.exact_duplicates.length > 0 && (
+        <div style={styles.duplicateSection}>
+          <h5 style={styles.sectionHeader}>
+            <span style={styles.headerIcon}>⚠️</span>
+            Exact Duplicates (Same Content)
+          </h5>
+          <p style={styles.sectionDescription}>
+            These files have identical content. Only one copy is needed.
+          </p>
+          {data.exact_duplicates.slice(0, 5).map((group, idx) => (
             <div key={idx} style={styles.duplicateGroup}>
-              <div style={styles.duplicateHeader}>Group {idx + 1} ({group.files.length} files)</div>
+              <div style={styles.duplicateHeader}>
+                Group {idx + 1} ({group.files.length} identical files)
+              </div>
               {group.files.map((file, fidx) => (
                 <div key={fidx} style={{
                   ...styles.duplicateFile,
-                  backgroundColor: file.s3_key === group.recommended_keep ? '#d4edda' : '#fff'
+                  backgroundColor: file.s3_key === group.recommended_keep ? '#d4edda' : '#fff3cd'
                 }}>
-                  {file.filename}
-                  {file.s3_key === group.recommended_keep && <span style={styles.keepBadge}>KEEP</span>}
+                  <span>{file.filename}</span>
+                  {file.s3_key === group.recommended_keep ?
+                    <span style={styles.keepBadge}>KEEP</span> :
+                    <span style={styles.removeBadge}>REMOVE</span>
+                  }
                 </div>
               ))}
             </div>
           ))}
+          {data.exact_duplicates.length > 5 && (
+            <div style={styles.moreItems}>...and {data.exact_duplicates.length - 5} more groups</div>
+          )}
+        </div>
+      )}
+
+      {/* Superseded Files Section */}
+      {data.superseded && data.superseded.length > 0 && (
+        <div style={styles.duplicateSection}>
+          <h5 style={styles.sectionHeader}>
+            <span style={styles.headerIcon}>📅</span>
+            Superseded Files (Older Versions)
+          </h5>
+          <p style={styles.sectionDescription}>
+            These are older versions of the same file type. The newest version is recommended.
+          </p>
+          {data.superseded.slice(0, 5).map((group, idx) => (
+            <div key={idx} style={styles.duplicateGroup}>
+              <div style={styles.duplicateHeader}>
+                {group.file_type} - {group.entity}
+              </div>
+              {group.files.map((file, fidx) => (
+                <div key={fidx} style={{
+                  ...styles.duplicateFile,
+                  backgroundColor: file.s3_key === group.recommended_keep ? '#d4edda' : '#e9ecef'
+                }}>
+                  <div style={styles.fileInfo}>
+                    <span>{file.filename}</span>
+                    <span style={styles.fileDate}>Date: {file.date}</span>
+                  </div>
+                  {file.s3_key === group.recommended_keep ?
+                    <span style={styles.keepBadge}>NEWEST - KEEP</span> :
+                    <span style={styles.oldBadge}>OLDER</span>
+                  }
+                </div>
+              ))}
+            </div>
+          ))}
+          {data.superseded.length > 5 && (
+            <div style={styles.moreItems}>...and {data.superseded.length - 5} more groups</div>
+          )}
+        </div>
+      )}
+
+      {(!data.exact_duplicates || data.exact_duplicates.length === 0) &&
+       (!data.superseded || data.superseded.length === 0) && (
+        <div style={styles.noIssues}>
+          <span style={styles.checkmark}>✓</span>
+          No duplicate or superseded files found.
         </div>
       )}
     </div>
@@ -576,6 +641,70 @@ const styles = {
     borderRadius: '4px',
     fontSize: '11px',
     fontWeight: 'bold'
+  },
+  removeBadge: {
+    backgroundColor: '#dc3545',
+    color: 'white',
+    padding: '2px 8px',
+    borderRadius: '4px',
+    fontSize: '11px',
+    fontWeight: 'bold'
+  },
+  oldBadge: {
+    backgroundColor: '#6c757d',
+    color: 'white',
+    padding: '2px 8px',
+    borderRadius: '4px',
+    fontSize: '11px',
+    fontWeight: 'bold'
+  },
+  duplicateSection: {
+    backgroundColor: '#fff',
+    padding: '16px',
+    borderRadius: '8px',
+    marginBottom: '16px'
+  },
+  sectionHeader: {
+    margin: '0 0 8px 0',
+    fontSize: '16px',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px'
+  },
+  headerIcon: {
+    fontSize: '18px'
+  },
+  sectionDescription: {
+    fontSize: '13px',
+    color: '#666',
+    marginBottom: '12px'
+  },
+  storageInfo: {
+    padding: '12px',
+    backgroundColor: '#fff',
+    borderRadius: '6px',
+    marginBottom: '16px',
+    textAlign: 'center'
+  },
+  fileInfo: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '2px'
+  },
+  fileDate: {
+    fontSize: '11px',
+    color: '#666'
+  },
+  noIssues: {
+    padding: '24px',
+    backgroundColor: '#d4edda',
+    borderRadius: '8px',
+    textAlign: 'center',
+    color: '#155724'
+  },
+  checkmark: {
+    fontSize: '24px',
+    marginRight: '8px'
   },
   workflowInfo: {
     padding: '12px',

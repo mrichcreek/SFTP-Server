@@ -9,13 +9,24 @@ from collections import defaultdict
 from datetime import datetime
 import re
 
-from file_naming_validator import (
-    validate_file_name,
-    get_file_metadata,
-    VALID_SOURCES,
-    VALID_ENTITIES,
-    ENTITY_ALIASES
-)
+try:
+    # Try relative import first (for package usage)
+    from .file_naming_validator import (
+        validate_file_name,
+        get_file_metadata,
+        VALID_SOURCES,
+        VALID_ENTITIES,
+        ENTITY_ALIASES
+    )
+except ImportError:
+    # Fall back to absolute import (for Lambda)
+    from file_validation.file_naming_validator import (
+        validate_file_name,
+        get_file_metadata,
+        VALID_SOURCES,
+        VALID_ENTITIES,
+        ENTITY_ALIASES
+    )
 
 
 @dataclass

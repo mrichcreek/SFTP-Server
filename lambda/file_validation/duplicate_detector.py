@@ -21,6 +21,16 @@ class DuplicateGroup:
 
 
 @dataclass
+class SupersededGroup:
+    """Represents files of the same type with different dates."""
+    file_type: str  # e.g., "HCM_PERSON_ADDRESS_INTF_FIMAS"
+    entity: str  # e.g., "FIMAS"
+    files: List[Dict]  # List of files sorted by date (newest first)
+    recommended_keep: str  # S3 key of newest file to keep
+    superseded_files: List[str]  # S3 keys of older files that could be removed
+
+
+@dataclass
 class DuplicateCheckResult:
     """Result of duplicate detection."""
     total_files: int
@@ -29,6 +39,9 @@ class DuplicateCheckResult:
     total_duplicates: int
     storage_waste_bytes: int
     groups: List[DuplicateGroup]
+    # New: Superseded files (same type, different dates)
+    superseded_groups: List[SupersededGroup] = None
+    total_superseded: int = 0
 
 
 def compute_file_hash(content: bytes) -> str:
@@ -108,10 +121,59 @@ def find_size_based_duplicates(file_list: List[Dict]) -> Dict[int, List[Dict]]:
     return {k: v for k, v in size_groups.items() if len(v) > 1}
 
 
+def find_superseded_files(file_list: List[Dict]) -> List[SupersededGroup]:
+    """
+    Find files that are superseded (same entity/source type but older dates).
+    The newest file in each group is recommended to keep.
+
+    Args:
+        file_list: List of dicts with {filename, s3_key, size, last_modified}
+
+    Returns:
+        List of SupersededGroup objects
+    """
+    # Group files by their type (entity + source pattern)
+    groups = defaultdict(list)
+
+    for file_info in file_list:
+        filename = file_info.get("filename", "")
+        key, date = extract_filename_key(filename)
+        if key and date:
+            file_info["_file_type"] = key
+            file_info["_date_portion"] = date
+            # Extract entity from the key (last part before date)
+            parts = key.split('_')
+            entity = parts[-1] if len(parts) > 3 else "UNKNOWN"
+            file_info["_entity"] = entity
+            groups[key].append(file_info)
+
+    # Build superseded groups (only where we have multiple dates)
+    superseded_groups = []
+    for file_type, files in groups.items():
+        if len(files) > 1:
+            # Sort by date portion descending (newest first)
+            sorted_files = sorted(files, key=lambda x: x.get("_date_portion", ""), reverse=True)
+
+            # The newest file is recommended to keep
+            newest = sorted_files[0]
+            superseded = [f["s3_key"] for f in sorted_files[1:]]
+
+            superseded_groups.append(SupersededGroup(
+                file_type=file_type,
+                entity=newest.get("_entity", "UNKNOWN"),
+                files=sorted_files,
+                recommended_keep=newest["s3_key"],
+                superseded_files=superseded
+            ))
+
+    return superseded_groups
+
+
 def find_exact_duplicates_s3(
     bucket_name: str,
     prefix: str = "",
-    s3_client=None
+    s3_client=None,
+    include_superseded: bool = True
 ) -> DuplicateCheckResult:
     """
     Find exact duplicates in S3 bucket by computing file hashes.
@@ -172,13 +234,22 @@ def find_exact_duplicates_s3(
             file_size = group_files[0]['size']
             storage_waste += file_size * (len(group_files) - 1)
 
+    # Find superseded files (same type, different dates)
+    superseded_groups = []
+    total_superseded = 0
+    if include_superseded:
+        superseded_groups = find_superseded_files(files)
+        total_superseded = sum(len(g.superseded_files) for g in superseded_groups)
+
     return DuplicateCheckResult(
         total_files=len(files),
         unique_files=len(files) - total_duplicates,
         duplicate_groups=len(groups),
         total_duplicates=total_duplicates,
         storage_waste_bytes=storage_waste,
-        groups=groups
+        groups=groups,
+        superseded_groups=superseded_groups,
+        total_superseded=total_superseded
     )
 
 
@@ -341,14 +412,35 @@ def lambda_handler(event, context):
         result = find_exact_duplicates_s3(bucket_name, prefix)
 
         if action == "check":
-            # Return structured data
+            # Return structured data for exact duplicates
             groups_data = []
             for group in result.groups:
                 groups_data.append({
                     "key": group.key,
                     "files": group.files,
-                    "recommended_keep": group.recommended_keep
+                    "recommended_keep": group.recommended_keep,
+                    "type": "exact_duplicate"
                 })
+
+            # Return structured data for superseded files
+            superseded_data = []
+            if result.superseded_groups:
+                for group in result.superseded_groups:
+                    # Clean up internal fields before returning
+                    clean_files = []
+                    for f in group.files:
+                        clean_file = {k: v for k, v in f.items() if not k.startswith('_')}
+                        clean_file['date'] = f.get('_date_portion', '')
+                        clean_files.append(clean_file)
+
+                    superseded_data.append({
+                        "file_type": group.file_type,
+                        "entity": group.entity,
+                        "files": clean_files,
+                        "recommended_keep": group.recommended_keep,
+                        "superseded_files": group.superseded_files,
+                        "type": "superseded"
+                    })
 
             return {
                 "statusCode": 200,
@@ -359,7 +451,9 @@ def lambda_handler(event, context):
                     "total_duplicates": result.total_duplicates,
                     "storage_waste_bytes": result.storage_waste_bytes,
                     "storage_waste_mb": round(result.storage_waste_bytes / 1024 / 1024, 2),
-                    "groups": groups_data
+                    "exact_duplicate_groups": groups_data,
+                    "superseded_groups": superseded_data,
+                    "total_superseded": result.total_superseded
                 }
             }
 
