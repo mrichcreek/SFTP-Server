@@ -1,0 +1,98 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Amplify
+frontend/amplify/
+frontend/.amplify/
+amplify-backup/
+aws-exports.js
+
+# Build outputs
+desktop_app/dist/
+desktop_app/build/
+*.spec
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+
+# Reference files (contain sensitive data patterns)
+RefrenceFiles/
+
+# Downloaded files list (generated)
+downloaded_files_list.txt
+
+# Certificates and credentials
+*.cer
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Claude settings
+.claude/
+
+# Original SFTP scripts (may contain credentials)
+SFTP*.py
+
+# Desktop app logs and permissions
+desktop_app/download_log.txt
+desktop_app/docs/Permissions.json

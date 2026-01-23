@@ -1,0 +1,14 @@
+# AWS Lambda dependencies for Hacienda SFTP Download Application
+
+# SFTP connectivity
+paramiko==3.4.0
+
+# AWS SDK
+boto3>=1.34.0
+botocore>=1.34.0
+
+# Database connectivity (for SQL Server)
+pyodbc==5.1.0
+
+# Utilities
+python-dateutil>=2.8.0

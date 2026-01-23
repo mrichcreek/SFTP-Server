@@ -1,0 +1,461 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hacienda SFTP to S3 Download Application
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - dev
+      - prod
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where Lambda will be deployed (must have access to SFTP server)
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs for Lambda (at least 2 for HA)
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group with outbound access to SFTP server (10.3.3.146:22)
+
+  SftpHost:
+    Type: String
+    Default: "10.3.3.146"
+    Description: SFTP server hostname/IP
+
+  SftpPort:
+    Type: String
+    Default: "22"
+    Description: SFTP server port
+
+  SftpUsername:
+    Type: String
+    Description: SFTP username
+    NoEcho: true
+
+  SftpPassword:
+    Type: String
+    Description: SFTP password
+    NoEcho: true
+
+Globals:
+  Function:
+    Timeout: 900
+    Runtime: python3.11
+    MemorySize: 512
+
+Resources:
+  # S3 Bucket for downloaded files
+  DownloadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hacienda-sftp-downloads-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # DynamoDB table for tracking download jobs
+  DownloadJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'hacienda-sftp-download-jobs-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: jobId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: jobId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Secrets Manager for SFTP credentials
+  SftpCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: hacienda-sftp-credentials
+      Description: SFTP server credentials for file downloads
+      SecretString: !Sub |
+        {
+          "host": "${SftpHost}",
+          "port": "${SftpPort}",
+          "username": "${SftpUsername}",
+          "password": "${SftpPassword}"
+        }
+
+  # Cognito User Pool
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: hacienda-sftp-client-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  # Cognito User Pool Client
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: hacienda-sftp-web-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Lambda execution role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hacienda-sftp-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SftpDownloadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DownloadsBucket.Arn
+                  - !Sub '${DownloadsBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref SftpCredentialsSecret
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt DownloadJobsTable.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda function for SFTP download
+  SftpDownloadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sftp-download-${Environment}'
+      CodeUri: ../lambda/sftp_download/
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          SECRETS_ARN: !Ref SftpCredentialsSecret
+          JOBS_TABLE: !Ref DownloadJobsTable
+          REMOTE_DOWNLOAD_FOLDER: /GPR/HCM
+      Events:
+        StartDownload:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /download
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for checking download status
+  DownloadStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sftp-download-status-${Environment}'
+      CodeUri: ../lambda/sftp_download/
+      Handler: handler.status_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref DownloadJobsTable
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        GetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /download/status/{jobId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for listing downloaded files
+  ListFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sftp-list-files-${Environment}'
+      CodeUri: ../lambda/sftp_download/
+      Handler: handler.list_files_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        ListFiles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /files
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # NEW: File Validation and Workflow Lambda Functions
+  # ============================================================================
+
+  # Lambda function for file name validation
+  ValidateFilesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-validate-files-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.validate_files_step
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+      Events:
+        ValidateFiles:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /validate
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for completeness checking
+  CheckCompletenessFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-check-completeness-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.check_completeness_step
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+      Events:
+        CheckCompleteness:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /completeness
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for duplicate detection
+  CheckDuplicatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-check-duplicates-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.check_duplicates_step
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+      Events:
+        CheckDuplicates:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /duplicates
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for database loading (requires VPC for SQL Server access)
+  LoadDatabaseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-load-database-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.load_database_step
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+          DB_SERVER: "10.0.151.32"
+          DB_DATABASE: "Hacienda_ERP"
+      Events:
+        LoadDatabase:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /load
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for complete workflow orchestration
+  WorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-workflow-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.run_complete_workflow
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+          SECRETS_ARN: !Ref SftpCredentialsSecret
+          DB_SERVER: "10.0.151.32"
+          DB_DATABASE: "Hacienda_ERP"
+      Events:
+        RunWorkflow:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /workflow
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for workflow status
+  WorkflowStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-workflow-status-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.get_workflow_status
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          JOBS_TABLE: !Ref DownloadJobsTable
+      Events:
+        GetWorkflowStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /workflow/status/{jobId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub 'hacienda-sftp-api-${Environment}'
+      StageName: !Ref Environment
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,Authorization'"
+        AllowOrigin: "'*'"
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref UserPoolClient
+
+  S3BucketName:
+    Description: S3 bucket for downloaded files
+    Value: !Ref DownloadsBucket
+
+  DownloadFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt SftpDownloadFunction.Arn
+
+  ValidateFunctionArn:
+    Description: File validation Lambda function ARN
+    Value: !GetAtt ValidateFilesFunction.Arn
+
+  WorkflowFunctionArn:
+    Description: Workflow orchestration Lambda function ARN
+    Value: !GetAtt WorkflowFunction.Arn
