@@ -47,7 +47,7 @@ yarn-error.log*
 frontend/amplify/
 frontend/.amplify/
 amplify-backup/
-aws-exports.js
+# Note: aws-exports.js is included in repo for Amplify deployment
 
 # Build outputs
 desktop_app/dist/
