@@ -10,6 +10,15 @@ const ValidationPanel = () => {
   const [workflowStatus, setWorkflowStatus] = useState(null);
   const [sqlPreview, setSqlPreview] = useState(null);
   const [sqlLoading, setSqlLoading] = useState(false);
+  const [expandedSections, setExpandedSections] = useState({});
+
+  // Toggle expanded section
+  const toggleSection = (sectionKey) => {
+    setExpandedSections(prev => ({
+      ...prev,
+      [sectionKey]: !prev[sectionKey]
+    }));
+  };
 
   // Validate file names
   const handleValidate = async () => {
@@ -551,14 +560,26 @@ const ValidationPanel = () => {
             </div>
             {data.steps.validation.invalid_files?.length > 0 && (
               <div style={styles.invalidList}>
-                <strong>Invalid files:</strong>
-                {data.steps.validation.invalid_files.slice(0, 5).map((f, i) => (
-                  <div key={i} style={styles.invalidItem}>
-                    {f.file_name}: {f.error_message}
+                <button
+                  style={styles.expandButton}
+                  onClick={() => toggleSection('invalidFiles')}
+                >
+                  {expandedSections.invalidFiles ? '▼' : '▶'} Invalid files ({data.steps.validation.invalid_files.length})
+                </button>
+                {expandedSections.invalidFiles && (
+                  <div style={styles.expandedContent}>
+                    {data.steps.validation.invalid_files.map((f, i) => (
+                      <div key={i} style={styles.invalidItemExpanded}>
+                        <div style={styles.invalidFileName}>{f.file_name}</div>
+                        {f.error_message && (
+                          <div style={styles.invalidError}>Error: {f.error_message}</div>
+                        )}
+                        {f.suggested_correction && (
+                          <div style={styles.invalidSuggestion}>Suggested: {f.suggested_correction}</div>
+                        )}
+                      </div>
+                    ))}
                   </div>
-                ))}
-                {data.steps.validation.invalid_files.length > 5 && (
-                  <div style={styles.moreItems}>...and {data.steps.validation.invalid_files.length - 5} more</div>
                 )}
               </div>
             )}
@@ -1179,6 +1200,44 @@ const styles = {
     color: '#dc3545',
     marginLeft: '12px',
     marginTop: '4px'
+  },
+  expandButton: {
+    background: 'none',
+    border: 'none',
+    color: '#dc3545',
+    cursor: 'pointer',
+    fontWeight: 'bold',
+    fontSize: '13px',
+    padding: '4px 0',
+    textAlign: 'left'
+  },
+  expandedContent: {
+    marginTop: '8px',
+    maxHeight: '300px',
+    overflowY: 'auto',
+    border: '1px solid #f5c6cb',
+    borderRadius: '4px',
+    backgroundColor: '#fff'
+  },
+  invalidItemExpanded: {
+    padding: '8px 12px',
+    borderBottom: '1px solid #f5c6cb'
+  },
+  invalidFileName: {
+    fontWeight: 'bold',
+    color: '#721c24',
+    wordBreak: 'break-all'
+  },
+  invalidError: {
+    color: '#dc3545',
+    fontSize: '12px',
+    marginTop: '2px'
+  },
+  invalidSuggestion: {
+    color: '#28a745',
+    fontSize: '12px',
+    marginTop: '2px',
+    fontStyle: 'italic'
   },
   downloadLink: {
     color: '#007bff',

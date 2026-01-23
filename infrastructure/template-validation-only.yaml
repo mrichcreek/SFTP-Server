@@ -22,6 +22,27 @@ Parameters:
     Description: Existing Cognito User Pool ARN
     Default: arn:aws:cognito-idp:us-east-1:087243890715:userpool/us-east-1_B9L2aprTj
 
+  # VPC Configuration for SQL Server access (same as TestFunction)
+  VpcId:
+    Type: String
+    Description: VPC ID for SQL Server connectivity
+    Default: vpc-021fa03b30758a270
+
+  SubnetId:
+    Type: String
+    Description: Subnet ID for Lambda functions that need SQL Server access
+    Default: subnet-08b10dbce706ef479
+
+  SecurityGroupId:
+    Type: String
+    Description: Security Group ID for Lambda functions that need SQL Server access
+    Default: sg-053f951a5563b6d5c
+
+  SqlSecretName:
+    Type: String
+    Description: AWS Secrets Manager secret name for SQL Server connection string
+    Default: Hacienda_ERP_Test_MSSQL_text
+
 Globals:
   Function:
     Timeout: 300
@@ -45,7 +66,7 @@ Resources:
         AttributeName: ttl
         Enabled: true
 
-  # Lambda execution role (no VPC)
+  # Lambda execution role (no VPC) - for validation functions
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -69,9 +90,52 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                   - s3:HeadObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:CopyObject
                 Resource:
                   - !Sub 'arn:aws:s3:::${S3BucketName}'
                   - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt JobsTable.Arn
+
+  # Lambda execution role with VPC access - for SQL loading functions
+  LambdaVpcExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hacienda-sql-lambda-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SqlLoaderPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SqlSecretName}*'
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -159,6 +223,77 @@ Resources:
             Path: /files
             Method: GET
 
+  # Lambda function for integrated validation workflow
+  RunWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-run-workflow-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.run_workflow_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          JOBS_TABLE: !Ref JobsTable
+      Events:
+        RunWorkflow:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /run-workflow
+            Method: POST
+
+  # Lambda function for previewing SQL load (what tables would be created)
+  PreviewSqlLoadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-preview-sql-load-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.sql_table_loader.preview_load_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+      Events:
+        PreviewLoad:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /preview-load
+            Method: POST
+
+  # Lambda function for loading files to SQL Server (requires VPC)
+  LoadToSqlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-load-to-sql-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.sql_table_loader.load_to_sql_handler
+      Role: !GetAtt LambdaVpcExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Layers:
+        # pymssql layer for SQL Server connectivity (no ODBC drivers needed)
+        - arn:aws:lambda:us-east-1:087243890715:layer:pymssql-python310:1
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          SQL_SECRET_NAME: !Ref SqlSecretName
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Events:
+        LoadToSql:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /load-to-sql
+            Method: POST
+
   # API Gateway with Cognito Authorizer
   ApiGateway:
     Type: AWS::Serverless::Api
@@ -208,3 +343,15 @@ Outputs:
   ValidateFunctionArn:
     Description: Validate files Lambda ARN
     Value: !GetAtt ValidateFilesFunction.Arn
+
+  PreviewSqlLoadFunctionArn:
+    Description: Preview SQL Load Lambda ARN
+    Value: !GetAtt PreviewSqlLoadFunction.Arn
+
+  LoadToSqlFunctionArn:
+    Description: Load to SQL Lambda ARN
+    Value: !GetAtt LoadToSqlFunction.Arn
+
+  RunWorkflowFunctionArn:
+    Description: Run Workflow Lambda ARN
+    Value: !GetAtt RunWorkflowFunction.Arn
