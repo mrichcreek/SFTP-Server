@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus, listFiles, previewSqlLoad, loadToSql, runValidationWorkflow } from '../services/api';
+import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus, listFiles, previewSqlLoad, loadToSql, runValidationWorkflow, runStoredProcedure, getProcedureStatus } from '../services/api';
 
 const ValidationPanel = () => {
   const [activeTab, setActiveTab] = useState('duplicates');
@@ -11,6 +11,9 @@ const ValidationPanel = () => {
   const [sqlPreview, setSqlPreview] = useState(null);
   const [sqlLoading, setSqlLoading] = useState(false);
   const [expandedSections, setExpandedSections] = useState({});
+  const [procTestMode, setProcTestMode] = useState(true);
+  const [procResult, setProcResult] = useState(null);
+  const [procLoading, setProcLoading] = useState(false);
 
   // Toggle expanded section
   const toggleSection = (sectionKey) => {
@@ -142,6 +145,35 @@ const ValidationPanel = () => {
       setError(err.message);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Run HCM_MAIN_INTF stored procedure
+  const handleRunStoredProcedure = async () => {
+    setProcLoading(true);
+    setError(null);
+    setProcResult(null);
+    try {
+      const result = await runStoredProcedure(procTestMode);
+      setProcResult(result);
+      setResults({ type: 'procedure', data: result });
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setProcLoading(false);
+    }
+  };
+
+  // Refresh procedure status
+  const handleRefreshProcStatus = async () => {
+    try {
+      const status = await getProcedureStatus();
+      setProcResult(prev => ({
+        ...prev,
+        ...status
+      }));
+    } catch (err) {
+      console.error('Error refreshing status:', err);
     }
   };
 
@@ -498,6 +530,125 @@ const ValidationPanel = () => {
     </div>
   );
 
+  const renderProcedureResults = (data) => (
+    <div style={styles.resultSection}>
+      <h4 style={styles.resultTitle}>Stored Procedure Results</h4>
+
+      {/* Status Banner */}
+      <div style={{
+        ...styles.statusBanner,
+        backgroundColor: data.status === 'success' ? '#d4edda' :
+          data.status === 'in_progress' ? '#fff3cd' : '#f8d7da'
+      }}>
+        <strong>Status: </strong>
+        {data.status === 'success' ? 'Completed Successfully' :
+          data.status === 'in_progress' ? 'In Progress...' :
+          'Error Occurred'}
+        {data.test_mode && <span style={styles.testModeBadge}>TEST MODE</span>}
+      </div>
+
+      {/* Execution Info */}
+      <div style={styles.execInfo}>
+        <div><strong>Execution ID:</strong> {data.execution_id}</div>
+        <div><strong>Started:</strong> {data.started_at}</div>
+        {data.completed_at && <div><strong>Completed:</strong> {data.completed_at}</div>}
+      </div>
+
+      {/* Run Status from RUN_INTF_STATUS table */}
+      {data.run_status && (
+        <div style={styles.runStatusBox}>
+          <h5 style={styles.subHeader}>Run Status</h5>
+          <div style={styles.runStatusGrid}>
+            <div><strong>Instance:</strong> {data.run_status.instance}</div>
+            <div><strong>Status:</strong> {data.run_status.status}</div>
+            <div><strong>Started:</strong> {data.run_status.date_started}</div>
+            <div><strong>Completed:</strong> {data.run_status.date_completed || 'In Progress'}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Error Details */}
+      {data.error && (
+        <div style={styles.errorBox}>
+          <h5 style={styles.errorHeader}>Error Details</h5>
+          <div style={styles.errorContent}>
+            <div><strong>Type:</strong> {data.error.type || 'Unknown'}</div>
+            <div><strong>Message:</strong> {data.error.message}</div>
+            {data.error.last_step && (
+              <div><strong>Last Completed Step:</strong> {data.error.last_step}</div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Steps Completed */}
+      {data.steps_completed && data.steps_completed.length > 0 && (
+        <div style={styles.stepsBox}>
+          <h5 style={styles.subHeader}>
+            Execution Steps ({data.steps_completed.length} logged)
+            <button
+              style={styles.refreshButton}
+              onClick={handleRefreshProcStatus}
+              title="Refresh status"
+            >
+              &#8635;
+            </button>
+          </h5>
+          <div style={styles.stepsList}>
+            {data.steps_completed.slice(0, 20).map((step, idx) => (
+              <div key={idx} style={styles.procStep}>
+                <span style={styles.stepNumber}>{data.steps_completed.length - idx}</span>
+                <span style={styles.stepText}>{step.step}</span>
+                {step.timestamp && (
+                  <span style={styles.stepTime}>{step.timestamp}</span>
+                )}
+              </div>
+            ))}
+            {data.steps_completed.length > 20 && (
+              <div style={styles.moreSteps}>
+                ...and {data.steps_completed.length - 20} earlier steps
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Delta Table Counts */}
+      {data.delta_counts && Object.keys(data.delta_counts).length > 0 && (
+        <div style={styles.deltaBox}>
+          <h5 style={styles.subHeader}>Delta Table Record Counts</h5>
+          <p style={styles.deltaDescription}>
+            These records will be exported to Oracle Cloud HCM
+          </p>
+          <div style={styles.deltaGrid}>
+            {Object.entries(data.delta_counts).map(([table, count]) => (
+              <div key={table} style={{
+                ...styles.deltaItem,
+                backgroundColor: count > 0 ? '#d4edda' : count < 0 ? '#f8d7da' : '#e9ecef'
+              }}>
+                <div style={styles.deltaTable}>
+                  {table.replace('HCM_', '').replace('_INTF_DELTA', '')}
+                </div>
+                <div style={styles.deltaCount}>
+                  {count >= 0 ? count.toLocaleString() : 'N/A'}
+                </div>
+              </div>
+            ))}
+          </div>
+          {data.delta_counts && (
+            <div style={styles.deltaTotal}>
+              <strong>Total Records:</strong>{' '}
+              {Object.values(data.delta_counts)
+                .filter(c => c >= 0)
+                .reduce((a, b) => a + b, 0)
+                .toLocaleString()}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
   const renderIntegratedWorkflowResults = (data) => (
     <div style={styles.resultSection}>
       <h4 style={styles.resultTitle}>Validation Workflow Results</h4>
@@ -688,6 +839,8 @@ const ValidationPanel = () => {
         return renderSqlPreviewResults(results.data);
       case 'sqlload':
         return renderSqlLoadResults(results.data);
+      case 'procedure':
+        return renderProcedureResults(results.data);
       default:
         return <pre>{JSON.stringify(results.data, null, 2)}</pre>;
     }
@@ -725,6 +878,12 @@ const ValidationPanel = () => {
           onClick={() => setActiveTab('sqlload')}
         >
           Load to SQL
+        </button>
+        <button
+          style={activeTab === 'processdata' ? styles.activeTab : styles.tab}
+          onClick={() => setActiveTab('processdata')}
+        >
+          Process Data
         </button>
       </div>
 
@@ -814,6 +973,49 @@ const ValidationPanel = () => {
             >
               {loading ? 'Analyzing Files...' : 'Preview SQL Load'}
             </button>
+          </div>
+        )}
+
+        {activeTab === 'processdata' && (
+          <div style={styles.section}>
+            <p style={styles.description}>
+              Execute the HCM_MAIN_INTF stored procedure on SQL Server. This processes the loaded CSV data,
+              removes duplicates, assigns Oracle Person Numbers, and creates DELTA tables ready for Oracle Cloud HCM import.
+            </p>
+
+            <div style={styles.testModeToggle}>
+              <label style={styles.toggleLabel}>
+                <input
+                  type="checkbox"
+                  checked={procTestMode}
+                  onChange={(e) => setProcTestMode(e.target.checked)}
+                  style={styles.toggleCheckbox}
+                />
+                <span style={styles.toggleText}>Test Mode</span>
+              </label>
+              <span style={styles.toggleDescription}>
+                {procTestMode
+                  ? 'Only process test SSNs (filtered data)'
+                  : 'Process ALL records (production mode)'}
+              </span>
+            </div>
+
+            <button
+              style={{
+                ...styles.actionButton,
+                backgroundColor: procLoading ? '#6c757d' : (procTestMode ? '#007bff' : '#dc3545')
+              }}
+              onClick={handleRunStoredProcedure}
+              disabled={procLoading}
+            >
+              {procLoading ? 'Running Stored Procedure...' : `Run HCM_MAIN_INTF ${procTestMode ? '(Test Mode)' : '(Production)'}`}
+            </button>
+
+            {!procTestMode && (
+              <div style={styles.warningBanner}>
+                Warning: Production mode will process ALL records. Make sure this is intended.
+              </div>
+            )}
           </div>
         )}
 
@@ -1278,6 +1480,189 @@ const styles = {
     marginTop: '8px',
     fontSize: '12px',
     color: '#666'
+  },
+  // Process Data tab styles
+  testModeToggle: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '16px',
+    marginBottom: '20px',
+    padding: '16px',
+    backgroundColor: '#f8f9fa',
+    borderRadius: '8px'
+  },
+  toggleLabel: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    cursor: 'pointer'
+  },
+  toggleCheckbox: {
+    width: '20px',
+    height: '20px',
+    cursor: 'pointer'
+  },
+  toggleText: {
+    fontWeight: 'bold',
+    fontSize: '16px'
+  },
+  toggleDescription: {
+    color: '#666',
+    fontSize: '14px'
+  },
+  warningBanner: {
+    marginTop: '16px',
+    padding: '12px 16px',
+    backgroundColor: '#fff3cd',
+    color: '#856404',
+    borderRadius: '6px',
+    border: '1px solid #ffc107'
+  },
+  testModeBadge: {
+    marginLeft: '12px',
+    padding: '4px 8px',
+    backgroundColor: '#007bff',
+    color: 'white',
+    borderRadius: '4px',
+    fontSize: '12px',
+    fontWeight: 'bold'
+  },
+  execInfo: {
+    padding: '12px 16px',
+    backgroundColor: '#e9ecef',
+    borderRadius: '6px',
+    marginBottom: '16px',
+    fontSize: '14px',
+    lineHeight: '1.8'
+  },
+  runStatusBox: {
+    padding: '16px',
+    backgroundColor: '#fff',
+    borderRadius: '8px',
+    marginBottom: '16px',
+    border: '1px solid #dee2e6'
+  },
+  subHeader: {
+    margin: '0 0 12px 0',
+    color: '#232f3e',
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px'
+  },
+  runStatusGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '8px',
+    fontSize: '14px'
+  },
+  errorBox: {
+    padding: '16px',
+    backgroundColor: '#f8d7da',
+    borderRadius: '8px',
+    marginBottom: '16px',
+    border: '1px solid #f5c6cb'
+  },
+  errorHeader: {
+    margin: '0 0 12px 0',
+    color: '#721c24'
+  },
+  errorContent: {
+    fontSize: '14px',
+    lineHeight: '1.8',
+    color: '#721c24'
+  },
+  stepsBox: {
+    padding: '16px',
+    backgroundColor: '#fff',
+    borderRadius: '8px',
+    marginBottom: '16px',
+    border: '1px solid #dee2e6'
+  },
+  refreshButton: {
+    background: 'none',
+    border: '1px solid #007bff',
+    borderRadius: '4px',
+    color: '#007bff',
+    cursor: 'pointer',
+    padding: '4px 8px',
+    fontSize: '16px'
+  },
+  procStep: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: '12px',
+    padding: '8px 0',
+    borderBottom: '1px solid #eee',
+    fontSize: '13px'
+  },
+  stepNumber: {
+    backgroundColor: '#007bff',
+    color: 'white',
+    borderRadius: '50%',
+    width: '24px',
+    height: '24px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    fontSize: '11px',
+    flexShrink: 0
+  },
+  stepText: {
+    flex: 1,
+    color: '#333'
+  },
+  stepTime: {
+    color: '#666',
+    fontSize: '11px',
+    whiteSpace: 'nowrap'
+  },
+  moreSteps: {
+    padding: '8px 0',
+    color: '#666',
+    fontStyle: 'italic',
+    textAlign: 'center'
+  },
+  deltaBox: {
+    padding: '16px',
+    backgroundColor: '#fff',
+    borderRadius: '8px',
+    border: '1px solid #dee2e6'
+  },
+  deltaDescription: {
+    fontSize: '13px',
+    color: '#666',
+    marginBottom: '12px'
+  },
+  deltaGrid: {
+    display: 'grid',
+    gridTemplateColumns: 'repeat(2, 1fr)',
+    gap: '8px'
+  },
+  deltaItem: {
+    padding: '12px',
+    borderRadius: '6px',
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center'
+  },
+  deltaTable: {
+    fontWeight: 'bold',
+    fontSize: '12px',
+    color: '#333'
+  },
+  deltaCount: {
+    fontSize: '18px',
+    fontWeight: 'bold',
+    color: '#232f3e'
+  },
+  deltaTotal: {
+    marginTop: '16px',
+    padding: '12px',
+    backgroundColor: '#232f3e',
+    color: 'white',
+    borderRadius: '6px',
+    textAlign: 'center',
+    fontSize: '16px'
   }
 };
 

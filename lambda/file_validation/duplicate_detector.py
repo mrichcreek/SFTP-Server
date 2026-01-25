@@ -321,6 +321,126 @@ def generate_duplicate_report(result: DuplicateCheckResult) -> str:
     return "\n".join(lines)
 
 
+def move_files_to_folder(
+    bucket_name: str,
+    files_to_move: List[str],
+    destination_folder: str = "DuplicateCheck",
+    s3_client=None
+) -> Dict:
+    """
+    Move files to a different folder within the same S3 bucket.
+
+    Args:
+        bucket_name: Name of S3 bucket
+        files_to_move: List of S3 keys to move
+        destination_folder: Target folder (default: DuplicateCheck)
+        s3_client: Optional boto3 S3 client
+
+    Returns:
+        Dictionary with move results
+    """
+    if s3_client is None:
+        s3_client = boto3.client('s3')
+
+    moved = []
+    errors = []
+
+    for source_key in files_to_move:
+        try:
+            # Get just the filename from the key
+            filename = source_key.split('/')[-1]
+            dest_key = f"{destination_folder}/{filename}"
+
+            # Copy to new location
+            s3_client.copy_object(
+                Bucket=bucket_name,
+                CopySource={'Bucket': bucket_name, 'Key': source_key},
+                Key=dest_key
+            )
+
+            # Delete original
+            s3_client.delete_object(Bucket=bucket_name, Key=source_key)
+
+            moved.append({
+                'source': source_key,
+                'destination': dest_key
+            })
+        except Exception as e:
+            errors.append({
+                'file': source_key,
+                'error': str(e)
+            })
+
+    return {
+        'moved_count': len(moved),
+        'moved_files': moved,
+        'errors': errors
+    }
+
+
+def move_duplicates_and_superseded(
+    bucket_name: str,
+    result: DuplicateCheckResult,
+    destination_folder: str = "DuplicateCheck",
+    s3_client=None
+) -> Dict:
+    """
+    Move duplicate and superseded files to a separate folder.
+
+    Args:
+        bucket_name: Name of S3 bucket
+        result: DuplicateCheckResult from find_exact_duplicates_s3
+        destination_folder: Target folder (default: DuplicateCheck)
+        s3_client: Optional boto3 S3 client
+
+    Returns:
+        Dictionary with move results and files kept
+    """
+    if s3_client is None:
+        s3_client = boto3.client('s3')
+
+    files_to_move = []
+    files_kept = []
+
+    # Collect exact duplicates to move (keep recommended, move others)
+    for group in result.groups:
+        for file_info in group.files:
+            if file_info['s3_key'] == group.recommended_keep:
+                files_kept.append(file_info['s3_key'])
+            else:
+                files_to_move.append(file_info['s3_key'])
+
+    # Collect superseded files to move (keep newest, move older)
+    if result.superseded_groups:
+        for group in result.superseded_groups:
+            files_kept.append(group.recommended_keep)
+            files_to_move.extend(group.superseded_files)
+
+    # Remove duplicates from files_to_move (a file might be in both groups)
+    files_to_move = list(set(files_to_move))
+
+    # Also remove any files_kept from files_to_move
+    files_kept_set = set(files_kept)
+    files_to_move = [f for f in files_to_move if f not in files_kept_set]
+
+    # Move the files
+    move_result = move_files_to_folder(
+        bucket_name,
+        files_to_move,
+        destination_folder,
+        s3_client
+    )
+
+    return {
+        'exact_duplicates_moved': sum(1 for g in result.groups for f in g.files if f['s3_key'] != g.recommended_keep),
+        'superseded_moved': result.total_superseded,
+        'total_moved': move_result['moved_count'],
+        'files_moved': move_result['moved_files'],
+        'files_kept': list(files_kept_set),
+        'errors': move_result['errors']
+    }
+
+
 def delete_duplicates(
     bucket_name: str,
     result: DuplicateCheckResult,

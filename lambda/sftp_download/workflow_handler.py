@@ -67,6 +67,12 @@ _duplicate_module = import_from_file('duplicate_detector',
     os.path.join(base_path, 'file_validation', 'duplicate_detector.py'))
 find_exact_duplicates_s3 = _duplicate_module.find_exact_duplicates_s3
 check_file_exists_in_s3 = _duplicate_module.check_file_exists_in_s3
+move_duplicates_and_superseded = _duplicate_module.move_duplicates_and_superseded
+
+# Import report generator
+_report_module = import_from_file('report_generator',
+    os.path.join(base_path, 'sftp_download', 'report_generator.py'))
+generate_and_upload_report = _report_module.generate_and_upload_report
 
 # Try to import from handler for SFTP functions (optional, not needed for validation)
 try:
@@ -730,6 +736,242 @@ def get_workflow_status(event, context):
 
 
 # ============================================================================
+# INTEGRATED VALIDATION WORKFLOW (with auto-move and reporting)
+# ============================================================================
+
+def run_validation_workflow_handler(event, context):
+    """
+    Lambda handler for the integrated validation workflow.
+
+    This workflow:
+    1. Checks for duplicates and superseded files -> auto-moves them to DuplicateCheck/
+    2. Validates file names
+    3. Checks completeness (each source has all 8 entity types)
+    4. If errors in 2 or 3: generates error report and returns URL
+    5. If no errors: proceeds to SQL load (if enabled)
+
+    Event format:
+    {
+        "bucket": "bucket-name",
+        "prefix": "optional/prefix/",
+        "load_to_sql": false  // Set true to load to SQL if all checks pass
+    }
+
+    Returns workflow result with step details and report URL if errors found.
+    """
+    parsed_event = parse_api_event(event) if 'body' in event else event
+
+    job_id = str(uuid.uuid4())[:8]
+    bucket = parsed_event.get("bucket", S3_BUCKET)
+    prefix = parsed_event.get("prefix", "")
+    load_to_sql = parsed_event.get("load_to_sql", False)
+
+    workflow_result = {
+        "workflow_id": job_id,
+        "status": "in_progress",
+        "bucket": bucket,
+        "prefix": prefix,
+        "steps": {},
+        "has_errors": False,
+        "report_url": None
+    }
+
+    try:
+        # ========================
+        # STEP 1: List Initial Files
+        # ========================
+        initial_files = list_s3_files(bucket, prefix)
+        # Exclude files already in DuplicateCheck folder
+        initial_files = [f for f in initial_files if not f['s3_key'].startswith('DuplicateCheck/')]
+
+        if not initial_files:
+            workflow_result["status"] = "failed"
+            workflow_result["error"] = "No files found in S3 bucket"
+            return format_response(400, workflow_result)
+
+        workflow_result["steps"]["initial_files"] = {
+            "status": "completed",
+            "total_files": len(initial_files)
+        }
+
+        # ========================
+        # STEP 2: Check Duplicates and Move to DuplicateCheck/
+        # ========================
+        dup_result = find_exact_duplicates_s3(bucket, prefix, s3_client, include_superseded=True)
+
+        # Auto-move duplicates and superseded files
+        move_result = move_duplicates_and_superseded(
+            bucket,
+            dup_result,
+            destination_folder="DuplicateCheck",
+            s3_client=s3_client
+        )
+
+        workflow_result["steps"]["duplicates"] = {
+            "status": "completed",
+            "exact_duplicates_moved": move_result.get('exact_duplicates_moved', 0),
+            "superseded_moved": move_result.get('superseded_moved', 0),
+            "total_moved": move_result.get('total_moved', 0),
+            "files_remaining": len(move_result.get('files_kept', [])),
+            "move_errors": move_result.get('errors', [])
+        }
+
+        # Get remaining files after move
+        remaining_files = list_s3_files(bucket, prefix)
+        remaining_files = [f for f in remaining_files if not f['s3_key'].startswith('DuplicateCheck/')]
+        file_names = [f['filename'] for f in remaining_files]
+
+        # ========================
+        # STEP 3: Validate File Names
+        # ========================
+        val_result = validate_file_list(file_names)
+
+        invalid_files = [
+            {
+                "file_name": r.file_name,
+                "error_message": r.error_message,
+                "suggested_correction": r.suggested_correction
+            }
+            for r in val_result["results"] if not r.is_valid
+        ]
+
+        workflow_result["steps"]["validation"] = {
+            "status": "passed" if val_result["invalid_count"] == 0 else "failed",
+            "valid_count": val_result["valid_count"],
+            "invalid_count": val_result["invalid_count"],
+            "invalid_files": invalid_files
+        }
+
+        if val_result["invalid_count"] > 0:
+            workflow_result["has_errors"] = True
+
+        # ========================
+        # STEP 4: Check Completeness
+        # ========================
+        comp_result = check_completeness(file_names)
+
+        file_sets_json = []
+        for fs in comp_result.file_sets:
+            file_sets_json.append({
+                "entity": fs.entity,
+                "date": fs.date,
+                "files": fs.files,
+                "missing_sources": fs.missing_sources,
+                "is_complete": fs.is_complete
+            })
+
+        workflow_result["steps"]["completeness"] = {
+            "status": "passed" if comp_result.incomplete_sets == 0 else "failed",
+            "complete_sets": comp_result.complete_sets,
+            "incomplete_sets": comp_result.incomplete_sets,
+            "completeness_percentage": round(comp_result.summary.get("complete_percentage", 0), 1),
+            "file_sets": file_sets_json
+        }
+
+        if comp_result.incomplete_sets > 0:
+            workflow_result["has_errors"] = True
+
+        # ========================
+        # STEP 5: Generate Report if Errors
+        # ========================
+        if workflow_result["has_errors"]:
+            # Prepare data for report
+            duplicate_data = {
+                "total_moved": move_result.get('total_moved', 0),
+                "exact_duplicates_moved": move_result.get('exact_duplicates_moved', 0),
+                "superseded_moved": move_result.get('superseded_moved', 0),
+                "files_moved": move_result.get('files_moved', []),
+                "files_kept": move_result.get('files_kept', [])
+            }
+
+            validation_data = {
+                "valid_count": val_result["valid_count"],
+                "invalid_count": val_result["invalid_count"],
+                "invalid_files": invalid_files
+            }
+
+            completeness_data = {
+                "complete_sets": comp_result.complete_sets,
+                "incomplete_sets": comp_result.incomplete_sets,
+                "file_sets": file_sets_json
+            }
+
+            report_result = generate_and_upload_report(
+                bucket,
+                duplicate_data,
+                validation_data,
+                completeness_data,
+                job_id,
+                s3_client
+            )
+
+            workflow_result["report_url"] = report_result.get("download_url")
+            workflow_result["report_name"] = report_result.get("report_name")
+            workflow_result["status"] = "errors_found"
+
+            workflow_result["steps"]["report"] = {
+                "status": "generated",
+                "report_name": report_result.get("report_name"),
+                "download_url": report_result.get("download_url")
+            }
+
+        # ========================
+        # STEP 6: Load to SQL (only if no errors and requested)
+        # ========================
+        elif load_to_sql:
+            # Import SQL loader
+            try:
+                _sql_module = import_from_file('sql_table_loader',
+                    os.path.join(base_path, 'sftp_download', 'sql_table_loader.py'))
+                load_all_newest_files = _sql_module.load_all_newest_files
+
+                # Prepare file list for SQL loader
+                files_for_sql = [
+                    {
+                        "filename": f['filename'],
+                        "s3_key": f['s3_key']
+                    }
+                    for f in remaining_files
+                ]
+
+                sql_result = load_all_newest_files(
+                    bucket=bucket,
+                    files=files_for_sql,
+                    drop_existing=True
+                )
+
+                workflow_result["steps"]["sql_load"] = {
+                    "status": "completed" if sql_result.get("failed", 0) == 0 else "partial",
+                    "total_tables": sql_result.get("total_tables", 0),
+                    "successful": sql_result.get("successful", 0),
+                    "failed": sql_result.get("failed", 0),
+                    "tables": sql_result.get("tables", [])
+                }
+
+                workflow_result["status"] = "completed"
+
+            except Exception as sql_error:
+                workflow_result["steps"]["sql_load"] = {
+                    "status": "failed",
+                    "error": str(sql_error)
+                }
+                workflow_result["status"] = "sql_load_failed"
+        else:
+            workflow_result["status"] = "completed"
+            workflow_result["steps"]["sql_load"] = {
+                "status": "skipped",
+                "message": "SQL load not requested"
+            }
+
+        return format_response(200, workflow_result)
+
+    except Exception as e:
+        workflow_result["status"] = "failed"
+        workflow_result["error"] = str(e)
+        return format_response(500, workflow_result)
+
+
+# ============================================================================
 # API GATEWAY HANDLERS (parse body from API Gateway events)
 # ============================================================================
 
@@ -775,6 +1017,11 @@ def list_files_handler(event, context):
         })
     except Exception as e:
         return format_response(500, {"error": str(e)})
+
+
+def run_workflow_handler(event, context):
+    """API Gateway handler for integrated validation workflow."""
+    return run_validation_workflow_handler(event, context)
 
 
 # ============================================================================

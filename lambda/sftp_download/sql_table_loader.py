@@ -290,6 +290,59 @@ def parse_connection_string(conn_str: str) -> Dict:
     return params
 
 
+def get_table_columns(cursor, table_name: str) -> List[str]:
+    """
+    Get the list of column names from a database table.
+
+    Args:
+        cursor: Database cursor
+        table_name: Name of the table
+
+    Returns:
+        List of column names (uppercase for comparison)
+    """
+    safe_table_name = sanitize_column_name(table_name)
+    cursor.execute(f"""
+        SELECT COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = '{safe_table_name}' AND TABLE_SCHEMA = 'dbo'
+        ORDER BY ORDINAL_POSITION
+    """)
+    return [row[0].upper() for row in cursor.fetchall()]
+
+
+def match_csv_to_db_columns(csv_headers: List[str], db_columns: List[str]) -> Tuple[List[int], List[str], List[str]]:
+    """
+    Match CSV headers to database columns (case-insensitive).
+
+    Args:
+        csv_headers: List of CSV column headers
+        db_columns: List of database column names
+
+    Returns:
+        Tuple of:
+        - indices: List of CSV column indices that match DB columns
+        - matched_db_cols: List of matched DB column names (in DB case)
+        - skipped_csv_cols: List of CSV columns that don't exist in DB
+    """
+    # Create lookup dict: uppercase -> original DB column name
+    db_col_lookup = {col.upper(): col for col in db_columns}
+
+    indices = []
+    matched_db_cols = []
+    skipped_csv_cols = []
+
+    for i, csv_col in enumerate(csv_headers):
+        csv_col_upper = csv_col.strip().upper()
+        if csv_col_upper in db_col_lookup:
+            indices.append(i)
+            matched_db_cols.append(db_col_lookup[csv_col_upper])
+        else:
+            skipped_csv_cols.append(csv_col)
+
+    return indices, matched_db_cols, skipped_csv_cols
+
+
 def load_file_to_sql(
     s3_client,
     connection_string: str,
@@ -303,6 +356,7 @@ def load_file_to_sql(
 
     NOTE: Tables must already exist in the database. This function does NOT
     create tables - it only clears existing data and inserts new rows.
+    CSV columns that don't exist in the DB table are skipped.
 
     Args:
         s3_client: Boto3 S3 client
@@ -324,7 +378,9 @@ def load_file_to_sql(
         's3_key': s3_key,
         'success': False,
         'rows_loaded': 0,
-        'error': None
+        'error': None,
+        'columns_matched': 0,
+        'columns_skipped': []
     }
 
     try:
@@ -343,32 +399,53 @@ def load_file_to_sql(
             user=conn_params['user'],
             password=conn_params['password'],
             database=conn_params['database'],
-            tds_version='7.3'
+            tds_version='7.3',
+            autocommit=False
         ) as conn:
             cursor = conn.cursor()
 
-            # Clear existing data if requested (don't drop/create - tables already exist)
+            # Get actual database columns for this table
+            db_columns = get_table_columns(cursor, table_name)
+
+            if not db_columns:
+                result['error'] = f'Table {table_name} not found or has no columns'
+                return result
+
+            # Match CSV headers to DB columns
+            col_indices, matched_db_cols, skipped_cols = match_csv_to_db_columns(headers, db_columns)
+
+            result['columns_matched'] = len(matched_db_cols)
+            result['columns_skipped'] = skipped_cols
+
+            if not matched_db_cols:
+                result['error'] = 'No CSV columns match database columns'
+                return result
+
+            # Clear existing data if requested
             if clear_existing:
-                try:
-                    # Try TRUNCATE first (faster, but requires ALTER permission)
-                    cursor.execute(f"TRUNCATE TABLE dbo.[{safe_table_name}]")
-                except Exception:
-                    # Fall back to DELETE if TRUNCATE fails (requires only DELETE permission)
-                    cursor.execute(f"DELETE FROM dbo.[{safe_table_name}]")
+                cursor.execute(f"DELETE FROM dbo.[{safe_table_name}]")
                 conn.commit()
 
-            # Insert data in batches
+            # Insert data in batches using only matched columns
             if rows:
-                insert_sql = generate_insert_sql_pymssql(table_name, headers)
+                # Build INSERT statement with only matched columns
+                column_names = ", ".join(f"[{col}]" for col in matched_db_cols)
+                placeholders = ", ".join(["%s"] * len(matched_db_cols))
+                insert_sql = f"INSERT INTO dbo.[{safe_table_name}] ({column_names}) VALUES ({placeholders})"
+
                 batch_size = 1000
                 for i in range(0, len(rows), batch_size):
                     batch = rows[i:i + batch_size]
-                    cursor.executemany(insert_sql, [tuple(row) for row in batch])
+                    # Extract only the matched columns from each row
+                    filtered_batch = [
+                        tuple(row[idx] if idx < len(row) else '' for idx in col_indices)
+                        for row in batch
+                    ]
+                    cursor.executemany(insert_sql, filtered_batch)
                 conn.commit()
                 result['rows_loaded'] = len(rows)
 
             result['success'] = True
-            result['columns'] = len(headers)
 
     except Exception as e:
         result['error'] = str(e)

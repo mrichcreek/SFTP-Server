@@ -129,6 +129,7 @@ Resources:
                   - s3:GetObject
                   - s3:ListBucket
                   - s3:HeadObject
+                  - s3:PutObject
                 Resource:
                   - !Sub 'arn:aws:s3:::${S3BucketName}'
                   - !Sub 'arn:aws:s3:::${S3BucketName}/*'
@@ -294,6 +295,66 @@ Resources:
             Path: /load-to-sql
             Method: POST
 
+  # Lambda function for running HCM_MAIN_INTF stored procedure (requires VPC)
+  RunStoredProcedureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-run-procedure-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.proc_runner_handler.run_stored_procedure_handler
+      Role: !GetAtt LambdaVpcExecutionRole.Arn
+      Timeout: 900  # 15 minutes - stored procedure can take a while
+      MemorySize: 1024
+      Layers:
+        # pymssql layer for SQL Server connectivity
+        - arn:aws:lambda:us-east-1:087243890715:layer:pymssql-python310:1
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          SQL_SECRET_NAME: !Ref SqlSecretName
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Events:
+        RunProcedure:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /run-procedure
+            Method: POST
+
+  # Lambda function for getting stored procedure status (requires VPC)
+  GetProcedureStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-procedure-status-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.proc_runner_handler.get_procedure_status_handler
+      Role: !GetAtt LambdaVpcExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Layers:
+        # pymssql layer for SQL Server connectivity
+        - arn:aws:lambda:us-east-1:087243890715:layer:pymssql-python310:1
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          SQL_SECRET_NAME: !Ref SqlSecretName
+      VpcConfig:
+        SubnetIds:
+          - !Ref SubnetId
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Events:
+        GetStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /procedure-status
+            Method: GET
+
   # API Gateway with Cognito Authorizer
   ApiGateway:
     Type: AWS::Serverless::Api
@@ -355,3 +416,11 @@ Outputs:
   RunWorkflowFunctionArn:
     Description: Run Workflow Lambda ARN
     Value: !GetAtt RunWorkflowFunction.Arn
+
+  RunStoredProcedureFunctionArn:
+    Description: Run Stored Procedure Lambda ARN
+    Value: !GetAtt RunStoredProcedureFunction.Arn
+
+  GetProcedureStatusFunctionArn:
+    Description: Get Procedure Status Lambda ARN
+    Value: !GetAtt GetProcedureStatusFunction.Arn
