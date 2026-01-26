@@ -259,6 +259,28 @@ class APIClient:
         response = requests.get(url, headers=self._get_headers())
         return self._handle_response(response)
 
+    def run_full_pipeline(self, environment='test', test_mode=True, source_prefix='downloads/'):
+        """Run the complete data processing pipeline."""
+        response = requests.post(
+            f"{self.endpoint}/full-pipeline",
+            headers=self._get_headers(),
+            json={
+                'environment': environment,
+                'test_mode': test_mode,
+                'source_prefix': source_prefix
+            },
+            timeout=900  # 15 minute timeout for long-running pipeline
+        )
+        return self._handle_response(response)
+
+    def list_pipeline_folders(self):
+        """List available pipeline folders (timestamped)."""
+        response = requests.get(
+            f"{self.endpoint}/pipeline-folders",
+            headers=self._get_headers()
+        )
+        return self._handle_response(response)
+
 
 # ============================================
 # MAIN APPLICATION
@@ -482,6 +504,7 @@ class HaciendaApp:
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=20, pady=(10, 20))
 
         # Create tabs
+        self.create_full_pipeline_tab()  # New: Full Pipeline tab first
         self.create_download_tab()
         self.create_duplicates_tab()
         self.create_validate_tab()
@@ -517,6 +540,265 @@ class HaciendaApp:
         self.auth.logout()
         self.api_client = None
         self.show_login_screen()
+
+    # ==========================================
+    # TAB: FULL PIPELINE
+    # ==========================================
+
+    def create_full_pipeline_tab(self):
+        """Create the Full Pipeline tab - single button to run entire workflow."""
+        frame = ttk.Frame(self.notebook, style='Card.TFrame', padding=20)
+        self.notebook.add(frame, text=" Full Pipeline ")
+
+        # Description
+        desc = ttk.Label(frame, text="Run the complete data processing pipeline with a single click.\n"
+            "Steps: Download → Duplicates → Validation → Schema Check → Completeness → SQL Load → Process",
+            style='Info.TLabel', wraplength=700, justify=tk.LEFT)
+        desc.pack(anchor=tk.W, pady=(0, 15))
+
+        # Options frame
+        options_frame = ttk.LabelFrame(frame, text=" Pipeline Options ", style='Card.TLabelframe', padding=15)
+        options_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # Environment selector
+        env_row = ttk.Frame(options_frame, style='Card.TFrame')
+        env_row.pack(fill=tk.X, pady=5)
+
+        ttk.Label(env_row, text="Database:", style='Info.TLabel').pack(side=tk.LEFT, padx=(0, 10))
+
+        self.pipe_env_var = tk.StringVar(value='test')
+        pipe_env_combo = ttk.Combobox(env_row, textvariable=self.pipe_env_var,
+            values=['test', 'production'], state='readonly', width=25)
+        pipe_env_combo.pack(side=tk.LEFT)
+        pipe_env_combo.bind('<<ComboboxSelected>>', self.on_pipe_env_changed)
+
+        self.pipe_env_label = ttk.Label(env_row, text="(Hacienda ERP Test)", style='Info.TLabel')
+        self.pipe_env_label.pack(side=tk.LEFT, padx=(10, 0))
+
+        # Production warning frame (hidden by default)
+        self.pipe_prod_warning = ttk.Frame(options_frame, style='Card.TFrame')
+        self.pipe_prod_warning_label = tk.Label(self.pipe_prod_warning,
+            text="⚠️ WARNING: Production database - changes affect live data!",
+            font=('Segoe UI', 10, 'bold'), bg=COLORS['error'], fg='white', padx=10, pady=8)
+        self.pipe_prod_warning_label.pack(fill=tk.X)
+
+        # Test mode checkbox
+        test_row = ttk.Frame(options_frame, style='Card.TFrame')
+        test_row.pack(fill=tk.X, pady=5)
+
+        self.pipe_test_var = tk.BooleanVar(value=True)
+        test_check = tk.Checkbutton(test_row, text="Test Mode (filter stored procedure to test SSNs only)",
+            variable=self.pipe_test_var, font=('Segoe UI', 10),
+            bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+            selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_medium'])
+        test_check.pack(side=tk.LEFT)
+
+        # Skip download checkbox
+        skip_row = ttk.Frame(options_frame, style='Card.TFrame')
+        skip_row.pack(fill=tk.X, pady=5)
+
+        self.pipe_skip_download_var = tk.BooleanVar(value=True)
+        skip_check = tk.Checkbutton(skip_row, text="Skip SFTP Download (use existing files in S3)",
+            variable=self.pipe_skip_download_var, font=('Segoe UI', 10),
+            bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+            selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_medium'])
+        skip_check.pack(side=tk.LEFT)
+
+        # Run button
+        self.pipe_run_btn = tk.Button(frame, text="▶  Run Full Pipeline", command=self.run_full_pipeline,
+            font=('Segoe UI', 14, 'bold'), bg=COLORS['success'], fg='white',
+            activebackground='#2d8a43', relief=tk.FLAT, cursor='hand2',
+            padx=50, pady=15)
+        self.pipe_run_btn.pack(pady=20)
+
+        # Progress frame
+        progress_frame = ttk.LabelFrame(frame, text=" Pipeline Progress ", style='Card.TLabelframe', padding=15)
+        progress_frame.pack(fill=tk.X, pady=(0, 15))
+
+        # Current step label
+        step_row = ttk.Frame(progress_frame, style='Card.TFrame')
+        step_row.pack(fill=tk.X, pady=(0, 10))
+
+        self.pipe_step_label = ttk.Label(step_row, text="Ready to start", style='Status.TLabel')
+        self.pipe_step_label.pack(side=tk.LEFT)
+
+        self.pipe_percent_label = ttk.Label(step_row, text="0%", style='Header.TLabel')
+        self.pipe_percent_label.pack(side=tk.RIGHT)
+
+        # Progress bar
+        self.pipe_progress_var = tk.DoubleVar()
+        self.pipe_progress_bar = ttk.Progressbar(progress_frame, variable=self.pipe_progress_var,
+            maximum=100, style='Custom.Horizontal.TProgressbar', length=400)
+        self.pipe_progress_bar.pack(fill=tk.X, pady=(0, 10))
+
+        # Status label
+        self.pipe_status_label = ttk.Label(progress_frame, text="", style='Info.TLabel')
+        self.pipe_status_label.pack(anchor=tk.W)
+
+        # Results frame (scrollable)
+        results_frame = ttk.LabelFrame(frame, text=" Results ", style='Card.TLabelframe', padding=10)
+        results_frame.pack(fill=tk.BOTH, expand=True)
+
+        # Canvas for scrolling
+        canvas = tk.Canvas(results_frame, bg=COLORS['bg_medium'], highlightthickness=0)
+        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=canvas.yview)
+        self.pipe_results_inner = ttk.Frame(canvas, style='Card.TFrame')
+
+        self.pipe_results_inner.bind('<Configure>',
+            lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+
+        canvas.create_window((0, 0), window=self.pipe_results_inner, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def on_pipe_env_changed(self, event=None):
+        """Handle pipeline environment selection change."""
+        env = self.pipe_env_var.get()
+        if env == 'production':
+            self.pipe_env_label.config(text="(Hacienda ERP)")
+            self.pipe_prod_warning.pack(fill=tk.X, pady=(10, 0))
+            self.pipe_run_btn.config(bg=COLORS['warning'])
+        else:
+            self.pipe_env_label.config(text="(Hacienda ERP Test)")
+            self.pipe_prod_warning.pack_forget()
+            self.pipe_run_btn.config(bg=COLORS['success'])
+
+    def run_full_pipeline(self):
+        """Run the complete data processing pipeline."""
+        env = self.pipe_env_var.get()
+
+        # Confirm if running on production
+        if env == 'production':
+            if not messagebox.askyesno("Confirm Production",
+                "You are about to run the FULL PIPELINE on the PRODUCTION database.\n\n"
+                "This will:\n"
+                "• Download files from SFTP\n"
+                "• Validate and load data to production SQL Server\n"
+                "• Run HCM_MAIN_INTF on production data\n\n"
+                "Are you absolutely sure you want to continue?"):
+                return
+
+        # Reset UI
+        self.pipe_run_btn.config(state=tk.DISABLED, text="Running...")
+        self.pipe_progress_var.set(0)
+        self.pipe_percent_label.config(text="0%")
+        self.pipe_step_label.config(text="Starting pipeline...")
+        self.pipe_status_label.config(text="")
+
+        # Clear results
+        for w in self.pipe_results_inner.winfo_children():
+            w.destroy()
+
+        def task():
+            try:
+                result = self.api_client.run_full_pipeline(
+                    environment=env,
+                    test_mode=self.pipe_test_var.get(),
+                    source_prefix='downloads/'
+                )
+                self.root.after(0, self.show_pipeline_result, result, None)
+            except Exception as e:
+                self.root.after(0, self.show_pipeline_result, None, str(e))
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def show_pipeline_result(self, result, error):
+        """Display full pipeline results."""
+        self.pipe_run_btn.config(state=tk.NORMAL, text="▶  Run Full Pipeline")
+
+        if error:
+            self.pipe_step_label.config(text="Pipeline Failed")
+            self.pipe_status_label.config(text=f"Error: {error}")
+            ttk.Label(self.pipe_results_inner, text=f"Error: {error}", style='Error.TLabel').pack(pady=10)
+            return
+
+        # Parse result
+        data = result
+        if isinstance(result.get('body'), str):
+            try:
+                data = json.loads(result['body'])
+            except:
+                data = result
+        elif isinstance(result.get('body'), dict):
+            data = result['body']
+
+        status = data.get('status', 'unknown')
+        pipeline_id = data.get('pipeline_id', '')
+        folder_name = data.get('folder_name', '')
+        completed_steps = data.get('completed_steps', 0)
+        total_steps = data.get('total_steps', 0)
+        steps = data.get('steps', [])
+        report_url = data.get('report_url')
+        error_msg = data.get('error')
+
+        # Update progress bar to 100% if complete
+        if status == 'success':
+            self.pipe_progress_var.set(100)
+            self.pipe_percent_label.config(text="100%")
+            self.pipe_step_label.config(text="Pipeline Complete!")
+        else:
+            pct = int((completed_steps / total_steps) * 100) if total_steps > 0 else 0
+            self.pipe_progress_var.set(pct)
+            self.pipe_percent_label.config(text=f"{pct}%")
+            self.pipe_step_label.config(text=f"Pipeline {status.title()}")
+
+        # Summary
+        summary_frame = ttk.Frame(self.pipe_results_inner, style='Card.TFrame')
+        summary_frame.pack(fill=tk.X, pady=10, padx=5)
+
+        status_color = COLORS['success'] if status == 'success' else COLORS['error']
+        tk.Label(summary_frame, text=f"Status: {status.upper()}",
+            font=('Segoe UI', 12, 'bold'), bg=COLORS['bg_medium'], fg=status_color).pack(anchor=tk.W)
+
+        ttk.Label(summary_frame, text=f"Pipeline ID: {pipeline_id}", style='Info.TLabel').pack(anchor=tk.W)
+        ttk.Label(summary_frame, text=f"Folder: {folder_name}", style='Info.TLabel').pack(anchor=tk.W)
+        ttk.Label(summary_frame, text=f"Steps: {completed_steps}/{total_steps} completed",
+            style='Info.TLabel').pack(anchor=tk.W)
+
+        # Error message
+        if error_msg:
+            error_frame = ttk.Frame(self.pipe_results_inner, style='Card.TFrame')
+            error_frame.pack(fill=tk.X, pady=10, padx=5)
+            tk.Label(error_frame, text=f"Error: {error_msg}",
+                font=('Segoe UI', 10), bg=COLORS['bg_medium'], fg=COLORS['error'],
+                wraplength=500, justify=tk.LEFT).pack(anchor=tk.W)
+
+        # Step details
+        if steps:
+            steps_frame = ttk.LabelFrame(self.pipe_results_inner, text=" Step Details ",
+                style='Card.TLabelframe', padding=10)
+            steps_frame.pack(fill=tk.X, pady=10, padx=5)
+
+            for step in steps:
+                step_name = step.get('step', 'Unknown')
+                step_success = step.get('success', False)
+                step_msg = step.get('message', '')
+
+                icon = "✓" if step_success else "✗"
+                color = COLORS['success'] if step_success else COLORS['error']
+
+                step_row = ttk.Frame(steps_frame, style='Card.TFrame')
+                step_row.pack(fill=tk.X, pady=2)
+
+                tk.Label(step_row, text=f"{icon} {step_name}",
+                    font=('Segoe UI', 10, 'bold'), bg=COLORS['bg_medium'], fg=color).pack(side=tk.LEFT)
+
+                if step_msg:
+                    ttk.Label(step_row, text=f" - {step_msg}", style='Info.TLabel').pack(side=tk.LEFT)
+
+        # Download report button
+        if report_url:
+            btn_frame = ttk.Frame(self.pipe_results_inner, style='Card.TFrame')
+            btn_frame.pack(fill=tk.X, pady=15, padx=5)
+
+            download_btn = tk.Button(btn_frame, text="📥 Download Report",
+                command=lambda: self.download_report(report_url, f"pipeline_report_{pipeline_id}.txt"),
+                font=('Segoe UI', 11, 'bold'), bg=COLORS['primary'], fg='white',
+                activebackground=COLORS['primary_dark'], relief=tk.FLAT, cursor='hand2',
+                padx=20, pady=10)
+            download_btn.pack()
 
     # ==========================================
     # TAB: DOWNLOAD (SFTP)

@@ -338,3 +338,57 @@ export async function getProcedureStatus(environment = 'test') {
 
   return response.json();
 }
+
+// ============================================================================
+// Full Pipeline API Functions
+// ============================================================================
+
+/**
+ * Run the complete data processing pipeline
+ * Steps: VPN Check -> SFTP Download -> Duplicate Check -> Name Validation ->
+ *        Schema Validation -> Completeness Check -> SQL Load -> Run Procedure
+ * @param {string} environment - 'test' or 'production'
+ * @param {boolean} testMode - If true, run stored procedure in test mode
+ * @param {string} sourcePrefix - S3 prefix where source files are located
+ * @returns {Promise} Pipeline execution results with step details
+ */
+export async function runFullPipeline(environment = 'test', testMode = true, sourcePrefix = 'downloads/') {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/full-pipeline`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      environment,
+      test_mode: testMode,
+      source_prefix: sourcePrefix
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to run full pipeline');
+  }
+
+  return response.json();
+}
+
+/**
+ * List available pipeline folders (timestamped)
+ * @returns {Promise} List of folder names
+ */
+export async function listPipelineFolders() {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/pipeline-folders`, {
+    method: 'GET',
+    headers
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to list pipeline folders');
+  }
+
+  return response.json();
+}

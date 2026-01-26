@@ -506,6 +506,63 @@ Resources:
               Authorizer: CognitoAuthorizer
 
   # ============================================================================
+  # Full Pipeline Function
+  # ============================================================================
+
+  # Lambda function for running the full data processing pipeline
+  FullPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-full-pipeline-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.full_pipeline.run_full_pipeline_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SFTP_HOST: !Ref SftpHost
+          SFTP_PORT: !Ref SftpPort
+      Events:
+        RunFullPipeline:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /full-pipeline
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for listing pipeline folders
+  PipelineFoldersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-pipeline-folders-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.full_pipeline.get_pipeline_folders_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        ListPipelineFolders:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /pipeline-folders
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
   # Stored Procedure Execution Functions
   # ============================================================================
 

@@ -1,8 +1,8 @@
 import React, { useState } from 'react';
-import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus, listFiles, previewSqlLoad, loadToSql, runValidationWorkflow, runStoredProcedure, getProcedureStatus } from '../services/api';
+import { validateFiles, checkCompleteness, checkDuplicates, runWorkflow, getWorkflowStatus, listFiles, previewSqlLoad, loadToSql, runValidationWorkflow, runStoredProcedure, getProcedureStatus, runFullPipeline } from '../services/api';
 
 const ValidationPanel = () => {
-  const [activeTab, setActiveTab] = useState('duplicates');
+  const [activeTab, setActiveTab] = useState('fullpipeline');
   const [loading, setLoading] = useState(false);
   const [results, setResults] = useState(null);
   const [error, setError] = useState(null);
@@ -15,6 +15,12 @@ const ValidationPanel = () => {
   const [procEnvironment, setProcEnvironment] = useState('test');
   const [procResult, setProcResult] = useState(null);
   const [procLoading, setProcLoading] = useState(false);
+  // Full Pipeline state
+  const [pipelineEnvironment, setPipelineEnvironment] = useState('test');
+  const [pipelineTestMode, setPipelineTestMode] = useState(true);
+  const [pipelineLoading, setPipelineLoading] = useState(false);
+  const [pipelineResult, setPipelineResult] = useState(null);
+  const [pipelineProgress, setPipelineProgress] = useState(0);
 
   // Toggle expanded section
   const toggleSection = (sectionKey) => {
@@ -175,6 +181,46 @@ const ValidationPanel = () => {
       }));
     } catch (err) {
       console.error('Error refreshing status:', err);
+    }
+  };
+
+  // Run full pipeline
+  const handleRunFullPipeline = async () => {
+    // Confirm if production
+    if (pipelineEnvironment === 'production') {
+      if (!window.confirm(
+        'You are about to run the FULL PIPELINE on the PRODUCTION database.\n\n' +
+        'This will:\n' +
+        '• Process files and validate data\n' +
+        '• Load data to production SQL Server\n' +
+        '• Run HCM_MAIN_INTF on production\n\n' +
+        'Are you absolutely sure you want to continue?'
+      )) {
+        return;
+      }
+    }
+
+    setPipelineLoading(true);
+    setError(null);
+    setPipelineResult(null);
+    setPipelineProgress(0);
+    try {
+      const result = await runFullPipeline(pipelineEnvironment, pipelineTestMode, 'downloads/');
+      setPipelineResult(result);
+      setResults({ type: 'fullPipeline', data: result });
+      // Update progress to 100% on completion
+      if (result.status === 'success') {
+        setPipelineProgress(100);
+      } else {
+        const pct = result.completed_steps && result.total_steps
+          ? Math.round((result.completed_steps / result.total_steps) * 100)
+          : 0;
+        setPipelineProgress(pct);
+      }
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPipelineLoading(false);
     }
   };
 
@@ -822,6 +868,105 @@ const ValidationPanel = () => {
     </div>
   );
 
+  const renderFullPipelineResults = (data) => (
+    <div style={styles.resultSection}>
+      <h4 style={styles.resultTitle}>Full Pipeline Results</h4>
+
+      {/* Status Banner */}
+      <div style={{
+        ...styles.statusBanner,
+        backgroundColor: data.status === 'success' ? '#d4edda' :
+          data.status === 'running' ? '#fff3cd' : '#f8d7da'
+      }}>
+        <strong>Status: </strong>
+        {data.status === 'success' ? 'Pipeline Completed Successfully' :
+          data.status === 'running' ? 'Pipeline Running...' :
+          'Pipeline Failed'}
+      </div>
+
+      {/* Pipeline Info */}
+      <div style={styles.execInfo}>
+        <div><strong>Pipeline ID:</strong> {data.pipeline_id}</div>
+        <div><strong>Folder:</strong> {data.folder_name}</div>
+        <div><strong>Started:</strong> {data.started_at}</div>
+        {data.completed_at && <div><strong>Completed:</strong> {data.completed_at}</div>}
+        <div><strong>Steps:</strong> {data.completed_steps}/{data.total_steps} completed</div>
+      </div>
+
+      {/* Progress Bar */}
+      <div style={styles.pipelineProgressContainer}>
+        <div style={styles.pipelineProgressBar}>
+          <div style={{
+            ...styles.pipelineProgressFill,
+            width: `${data.completed_steps && data.total_steps
+              ? (data.completed_steps / data.total_steps) * 100 : 0}%`
+          }} />
+        </div>
+        <div style={styles.pipelineProgressText}>
+          {data.current_step?.replace(/_/g, ' ').toUpperCase() || 'Starting...'}
+        </div>
+      </div>
+
+      {/* Error Message */}
+      {data.error && (
+        <div style={styles.errorBox}>
+          <h5 style={styles.errorHeader}>Error</h5>
+          <div style={styles.errorContent}>{data.error}</div>
+        </div>
+      )}
+
+      {/* Step Results */}
+      {data.steps && data.steps.length > 0 && (
+        <div style={styles.stepsBox}>
+          <h5 style={styles.subHeader}>Step Details</h5>
+          <div style={styles.pipelineStepsList}>
+            {data.steps.map((step, idx) => (
+              <div key={idx} style={{
+                ...styles.pipelineStep,
+                borderLeft: `4px solid ${step.success ? '#28a745' : '#dc3545'}`
+              }}>
+                <div style={styles.pipelineStepHeader}>
+                  <span style={step.success ? styles.successIcon : styles.errorIcon}>
+                    {step.success ? '✓' : '✗'}
+                  </span>
+                  <span style={styles.pipelineStepName}>
+                    {step.step?.replace(/_/g, ' ').toUpperCase()}
+                  </span>
+                </div>
+                <div style={styles.pipelineStepMessage}>{step.message}</div>
+                {step.report_key && (
+                  <div style={styles.pipelineStepReport}>
+                    Report saved: {step.report_key}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Download Report Button */}
+      {data.report_url && (
+        <div style={styles.reportSection}>
+          <button
+            style={styles.downloadButton}
+            onClick={() => {
+              const link = document.createElement('a');
+              link.href = data.report_url;
+              link.download = `pipeline_report_${data.pipeline_id}.txt`;
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+            }}
+          >
+            <span style={styles.downloadIcon}>&#8681;</span>
+            Download Pipeline Report
+          </button>
+        </div>
+      )}
+    </div>
+  );
+
   const renderResults = () => {
     if (!results) return null;
 
@@ -842,6 +987,8 @@ const ValidationPanel = () => {
         return renderSqlLoadResults(results.data);
       case 'procedure':
         return renderProcedureResults(results.data);
+      case 'fullPipeline':
+        return renderFullPipelineResults(results.data);
       default:
         return <pre>{JSON.stringify(results.data, null, 2)}</pre>;
     }
@@ -850,6 +997,12 @@ const ValidationPanel = () => {
   return (
     <div style={styles.container}>
       <div style={styles.tabs}>
+        <button
+          style={activeTab === 'fullpipeline' ? styles.activeTab : styles.tab}
+          onClick={() => setActiveTab('fullpipeline')}
+        >
+          Full Pipeline
+        </button>
         <button
           style={activeTab === 'duplicates' ? styles.activeTab : styles.tab}
           onClick={() => setActiveTab('duplicates')}
@@ -889,6 +1042,82 @@ const ValidationPanel = () => {
       </div>
 
       <div style={styles.content}>
+        {activeTab === 'fullpipeline' && (
+          <div style={styles.section}>
+            <h3 style={styles.pipelineTitle}>Complete Data Processing Pipeline</h3>
+            <p style={styles.description}>
+              Run the entire data processing workflow with a single click:
+            </p>
+            <ol style={styles.pipelineStepList}>
+              <li>Check VPN connectivity</li>
+              <li>Copy files to timestamped folder</li>
+              <li>Detect and move duplicate files</li>
+              <li>Validate file names</li>
+              <li>Validate column schemas</li>
+              <li>Check file completeness</li>
+              <li>Load data to SQL Server</li>
+              <li>Run HCM_MAIN_INTF stored procedure</li>
+            </ol>
+
+            <div style={styles.pipelineOptions}>
+              <div style={styles.environmentSelector}>
+                <label style={styles.envLabel}>Database Environment:</label>
+                <select
+                  value={pipelineEnvironment}
+                  onChange={(e) => setPipelineEnvironment(e.target.value)}
+                  style={styles.envSelect}
+                >
+                  <option value="test">Hacienda ERP Test</option>
+                  <option value="production">Hacienda ERP (Production)</option>
+                </select>
+              </div>
+
+              {pipelineEnvironment === 'production' && (
+                <div style={styles.productionWarning}>
+                  WARNING: Production database selected - changes will affect live data!
+                </div>
+              )}
+
+              <div style={styles.testModeToggle}>
+                <label style={styles.toggleLabel}>
+                  <input
+                    type="checkbox"
+                    checked={pipelineTestMode}
+                    onChange={(e) => setPipelineTestMode(e.target.checked)}
+                    style={styles.toggleCheckbox}
+                  />
+                  <span style={styles.toggleText}>Test Mode (filter stored procedure to test SSNs only)</span>
+                </label>
+              </div>
+            </div>
+
+            {/* Progress Bar */}
+            {pipelineLoading && (
+              <div style={styles.pipelineProgressContainer}>
+                <div style={styles.pipelineProgressLabel}>Running pipeline...</div>
+                <div style={styles.pipelineProgressBar}>
+                  <div style={{
+                    ...styles.pipelineProgressFill,
+                    width: `${pipelineProgress}%`
+                  }} />
+                </div>
+              </div>
+            )}
+
+            <button
+              style={{
+                ...styles.pipelineRunButton,
+                backgroundColor: pipelineLoading ? '#6c757d' :
+                  pipelineEnvironment === 'production' ? '#dc3545' : '#28a745'
+              }}
+              onClick={handleRunFullPipeline}
+              disabled={pipelineLoading}
+            >
+              {pipelineLoading ? 'Running Pipeline...' : 'Run Full Pipeline'}
+            </button>
+          </div>
+        )}
+
         {activeTab === 'duplicates' && (
           <div style={styles.section}>
             <p style={styles.description}>
@@ -1715,6 +1944,101 @@ const styles = {
     color: 'white',
     borderRadius: '6px',
     textAlign: 'center',
+    fontSize: '16px'
+  },
+  // Full Pipeline styles
+  pipelineTitle: {
+    marginTop: 0,
+    marginBottom: '16px',
+    color: '#232f3e'
+  },
+  pipelineStepList: {
+    marginBottom: '24px',
+    paddingLeft: '20px',
+    lineHeight: '2'
+  },
+  pipelineOptions: {
+    padding: '20px',
+    backgroundColor: '#f8f9fa',
+    borderRadius: '8px',
+    marginBottom: '20px'
+  },
+  pipelineRunButton: {
+    padding: '16px 48px',
+    color: 'white',
+    border: 'none',
+    borderRadius: '8px',
+    cursor: 'pointer',
+    fontSize: '18px',
+    fontWeight: 'bold',
+    display: 'block',
+    margin: '0 auto'
+  },
+  pipelineProgressContainer: {
+    marginBottom: '20px'
+  },
+  pipelineProgressLabel: {
+    fontSize: '14px',
+    color: '#666',
+    marginBottom: '8px',
+    textAlign: 'center'
+  },
+  pipelineProgressBar: {
+    height: '20px',
+    backgroundColor: '#e9ecef',
+    borderRadius: '10px',
+    overflow: 'hidden'
+  },
+  pipelineProgressFill: {
+    height: '100%',
+    backgroundColor: '#28a745',
+    transition: 'width 0.5s ease',
+    borderRadius: '10px'
+  },
+  pipelineProgressText: {
+    marginTop: '8px',
+    fontSize: '14px',
+    color: '#666',
+    textAlign: 'center'
+  },
+  pipelineStepsList: {
+    marginTop: '12px'
+  },
+  pipelineStep: {
+    padding: '12px 16px',
+    backgroundColor: '#fff',
+    borderRadius: '0 8px 8px 0',
+    marginBottom: '8px'
+  },
+  pipelineStepHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    marginBottom: '4px'
+  },
+  pipelineStepName: {
+    fontWeight: 'bold',
+    fontSize: '14px'
+  },
+  pipelineStepMessage: {
+    fontSize: '13px',
+    color: '#666',
+    marginLeft: '24px'
+  },
+  pipelineStepReport: {
+    fontSize: '12px',
+    color: '#17a2b8',
+    marginTop: '4px',
+    marginLeft: '24px'
+  },
+  successIcon: {
+    color: '#28a745',
+    fontWeight: 'bold',
+    fontSize: '16px'
+  },
+  errorIcon: {
+    color: '#dc3545',
+    fontWeight: 'bold',
     fontSize: '16px'
   }
 };
