@@ -149,7 +149,8 @@ def clear_proc_trace(cursor):
 
 def execute_hcm_main_intf(
     test_execution: bool = True,
-    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text'
+    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+    database_override: str = None
 ) -> Dict:
     """
     Execute the HCM_MAIN_INTF stored procedure.
@@ -157,6 +158,8 @@ def execute_hcm_main_intf(
     Args:
         test_execution: If True, run in test mode (filters to test SSNs)
         secret_name: AWS Secrets Manager secret containing connection string
+        database_override: Optional database name to override the one in connection string
+                          Use 'Hacienda ERP' for production, None for test (default)
 
     Returns:
         Dict with execution results including:
@@ -176,6 +179,7 @@ def execute_hcm_main_intf(
         'status': 'error',
         'execution_id': execution_id,
         'test_mode': test_execution,
+        'database': database_override or 'Hacienda ERP Test',
         'started_at': datetime.now().isoformat(),
         'completed_at': None,
         'steps_completed': [],
@@ -188,6 +192,10 @@ def execute_hcm_main_intf(
         # Get connection string from secrets
         connection_string = get_aws_secret(secret_name)
         conn_params = parse_connection_string(connection_string)
+
+        # Override database if specified (for switching between test/production)
+        if database_override:
+            conn_params['database'] = database_override
 
         # Connect to SQL Server
         with pymssql.connect(
@@ -268,7 +276,10 @@ def execute_hcm_main_intf(
     return result
 
 
-def get_procedure_status(secret_name: str = 'Hacienda_ERP_Test_MSSQL_text') -> Dict:
+def get_procedure_status(
+    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+    database_override: str = None
+) -> Dict:
     """
     Get the current status of the stored procedure execution.
 
@@ -276,6 +287,8 @@ def get_procedure_status(secret_name: str = 'Hacienda_ERP_Test_MSSQL_text') -> D
 
     Args:
         secret_name: AWS Secrets Manager secret containing connection string
+        database_override: Optional database name to override the one in connection string
+                          Use 'Hacienda ERP' for production, None for test (default)
 
     Returns:
         Dict with run_status, steps_completed, and delta_counts
@@ -286,12 +299,17 @@ def get_procedure_status(secret_name: str = 'Hacienda_ERP_Test_MSSQL_text') -> D
         'run_status': None,
         'steps_completed': [],
         'delta_counts': {},
+        'database': database_override or 'Hacienda ERP Test',
         'error': None
     }
 
     try:
         connection_string = get_aws_secret(secret_name)
         conn_params = parse_connection_string(connection_string)
+
+        # Override database if specified (for switching between test/production)
+        if database_override:
+            conn_params['database'] = database_override
 
         with pymssql.connect(
             server=conn_params['server'],

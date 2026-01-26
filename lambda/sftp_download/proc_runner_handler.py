@@ -45,6 +45,7 @@ def run_stored_procedure_handler(event, context):
     POST /run-procedure
     Body: {
         "test_mode": true/false  (optional, defaults to true for safety)
+        "environment": "test" or "production" (optional, defaults to "test")
     }
 
     Returns:
@@ -60,14 +61,26 @@ def run_stored_procedure_handler(event, context):
         # Get test mode from request (default to True for safety)
         test_mode = body.get('test_mode', True)
 
+        # Get environment from request (default to 'test' for safety)
+        environment = body.get('environment', 'test')
+
+        # Determine database based on environment
+        # Both databases are on the same server, just different database names
+        database_override = None
+        if environment == 'production':
+            database_override = 'Hacienda ERP'  # Production database
+        # else: use default from secret ('Hacienda ERP Test')
+
         # Get secret name from environment or use default
         secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
 
         # Execute the stored procedure
         result = execute_hcm_main_intf(
             test_execution=test_mode,
-            secret_name=secret_name
+            secret_name=secret_name,
+            database_override=database_override
         )
+        result['environment'] = environment
 
         # If there was an error, also generate the report and upload to S3
         if result.get('status') == 'error' and result.get('error'):
@@ -113,7 +126,7 @@ def get_procedure_status_handler(event, context):
     """
     Lambda handler to get the current status of stored procedure execution.
 
-    GET /procedure-status
+    GET /procedure-status?environment=test|production
 
     This endpoint can be polled to check on a long-running execution.
 
@@ -121,11 +134,24 @@ def get_procedure_status_handler(event, context):
         Current run status, completed steps, and delta counts
     """
     try:
+        # Get environment from query string (default to 'test' for safety)
+        query_params = event.get('queryStringParameters') or {}
+        environment = query_params.get('environment', 'test')
+
+        # Determine database based on environment
+        database_override = None
+        if environment == 'production':
+            database_override = 'Hacienda ERP'  # Production database
+
         # Get secret name from environment or use default
         secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
 
         # Get current status
-        result = get_procedure_status(secret_name=secret_name)
+        result = get_procedure_status(
+            secret_name=secret_name,
+            database_override=database_override
+        )
+        result['environment'] = environment
 
         return make_response(200, result)
 

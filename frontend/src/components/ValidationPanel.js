@@ -12,6 +12,7 @@ const ValidationPanel = () => {
   const [sqlLoading, setSqlLoading] = useState(false);
   const [expandedSections, setExpandedSections] = useState({});
   const [procTestMode, setProcTestMode] = useState(true);
+  const [procEnvironment, setProcEnvironment] = useState('test');
   const [procResult, setProcResult] = useState(null);
   const [procLoading, setProcLoading] = useState(false);
 
@@ -154,7 +155,7 @@ const ValidationPanel = () => {
     setError(null);
     setProcResult(null);
     try {
-      const result = await runStoredProcedure(procTestMode);
+      const result = await runStoredProcedure(procTestMode, procEnvironment);
       setProcResult(result);
       setResults({ type: 'procedure', data: result });
     } catch (err) {
@@ -167,7 +168,7 @@ const ValidationPanel = () => {
   // Refresh procedure status
   const handleRefreshProcStatus = async () => {
     try {
-      const status = await getProcedureStatus();
+      const status = await getProcedureStatus(procEnvironment);
       setProcResult(prev => ({
         ...prev,
         ...status
@@ -983,6 +984,24 @@ const ValidationPanel = () => {
               removes duplicates, assigns Oracle Person Numbers, and creates DELTA tables ready for Oracle Cloud HCM import.
             </p>
 
+            <div style={styles.environmentSelector}>
+              <label style={styles.envLabel}>Database Environment:</label>
+              <select
+                value={procEnvironment}
+                onChange={(e) => setProcEnvironment(e.target.value)}
+                style={styles.envSelect}
+              >
+                <option value="test">Hacienda ERP Test</option>
+                <option value="production">Hacienda ERP (Production)</option>
+              </select>
+            </div>
+
+            {procEnvironment === 'production' && (
+              <div style={styles.productionWarning}>
+                ⚠️ PRODUCTION DATABASE SELECTED - Changes will affect live data!
+              </div>
+            )}
+
             <div style={styles.testModeToggle}>
               <label style={styles.toggleLabel}>
                 <input
@@ -991,29 +1010,29 @@ const ValidationPanel = () => {
                   onChange={(e) => setProcTestMode(e.target.checked)}
                   style={styles.toggleCheckbox}
                 />
-                <span style={styles.toggleText}>Test Mode</span>
+                <span style={styles.toggleText}>Test Mode (Filter SSNs)</span>
               </label>
               <span style={styles.toggleDescription}>
                 {procTestMode
                   ? 'Only process test SSNs (filtered data)'
-                  : 'Process ALL records (production mode)'}
+                  : 'Process ALL records'}
               </span>
             </div>
 
             <button
               style={{
                 ...styles.actionButton,
-                backgroundColor: procLoading ? '#6c757d' : (procTestMode ? '#007bff' : '#dc3545')
+                backgroundColor: procLoading ? '#6c757d' : (procEnvironment === 'production' ? '#dc3545' : '#007bff')
               }}
               onClick={handleRunStoredProcedure}
               disabled={procLoading}
             >
-              {procLoading ? 'Running Stored Procedure...' : `Run HCM_MAIN_INTF ${procTestMode ? '(Test Mode)' : '(Production)'}`}
+              {procLoading ? 'Running Stored Procedure...' : `Run HCM_MAIN_INTF on ${procEnvironment === 'production' ? 'PRODUCTION' : 'Test'} ${procTestMode ? '(Test SSNs)' : '(All Records)'}`}
             </button>
 
-            {!procTestMode && (
+            {procEnvironment === 'production' && !procTestMode && (
               <div style={styles.warningBanner}>
-                Warning: Production mode will process ALL records. Make sure this is intended.
+                ⚠️ WARNING: You are about to run on PRODUCTION database with ALL records. This cannot be undone!
               </div>
             )}
           </div>
@@ -1482,6 +1501,40 @@ const styles = {
     color: '#666'
   },
   // Process Data tab styles
+  environmentSelector: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px',
+    marginBottom: '16px',
+    padding: '16px',
+    backgroundColor: '#f0f4f8',
+    borderRadius: '8px',
+    border: '1px solid #d0d7de'
+  },
+  envLabel: {
+    fontWeight: 'bold',
+    fontSize: '14px',
+    color: '#333'
+  },
+  envSelect: {
+    padding: '10px 16px',
+    fontSize: '14px',
+    borderRadius: '6px',
+    border: '1px solid #ccc',
+    backgroundColor: 'white',
+    cursor: 'pointer',
+    minWidth: '200px'
+  },
+  productionWarning: {
+    padding: '12px 16px',
+    backgroundColor: '#f8d7da',
+    color: '#721c24',
+    borderRadius: '6px',
+    border: '1px solid #f5c6cb',
+    marginBottom: '16px',
+    fontWeight: 'bold',
+    fontSize: '14px'
+  },
   testModeToggle: {
     display: 'flex',
     alignItems: 'center',

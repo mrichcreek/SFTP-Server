@@ -297,15 +297,16 @@ export async function runValidationWorkflow(loadToSqlFlag = false) {
  * Run the HCM_MAIN_INTF stored procedure
  * This processes the loaded CSV data and prepares delta records for Oracle
  * @param {boolean} testMode - If true, runs in test mode (filters to specific test SSNs)
+ * @param {string} environment - 'test' for Hacienda ERP Test, 'production' for Hacienda ERP
  * @returns {Promise} Execution results including status, steps completed, delta counts
  */
-export async function runStoredProcedure(testMode = true) {
+export async function runStoredProcedure(testMode = true, environment = 'test') {
   const headers = await getAuthHeaders();
 
   const response = await fetch(`${API_ENDPOINT}/run-procedure`, {
     method: 'POST',
     headers,
-    body: JSON.stringify({ test_mode: testMode })
+    body: JSON.stringify({ test_mode: testMode, environment })
   });
 
   if (!response.ok) {
@@ -319,12 +320,13 @@ export async function runStoredProcedure(testMode = true) {
 /**
  * Get the current status of stored procedure execution
  * Can be used to poll for progress during a long-running execution
+ * @param {string} environment - 'test' for Hacienda ERP Test, 'production' for Hacienda ERP
  * @returns {Promise} Current run status, completed steps, and delta counts
  */
-export async function getProcedureStatus() {
+export async function getProcedureStatus(environment = 'test') {
   const headers = await getAuthHeaders();
 
-  const response = await fetch(`${API_ENDPOINT}/procedure-status`, {
+  const response = await fetch(`${API_ENDPOINT}/procedure-status?environment=${environment}`, {
     method: 'GET',
     headers
   });
