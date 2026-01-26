@@ -17,6 +17,7 @@ import requests
 import os
 import stat
 import json
+import webbrowser
 from datetime import datetime
 from botocore.exceptions import ClientError, NoCredentialsError
 
@@ -773,22 +774,38 @@ class HaciendaApp:
             ttk.Label(self.dup_results_frame, text=f"Error: {error}", style='Error.TLabel').pack()
             return
 
-        data = result.get('body', result) if isinstance(result.get('body'), dict) else result
+        # Parse body if it's a string
+        data = result
+        if isinstance(result.get('body'), str):
+            try:
+                data = json.loads(result['body'])
+            except:
+                data = result
+        elif isinstance(result.get('body'), dict):
+            data = result['body']
 
         # Stats
         stats_frame = ttk.Frame(self.dup_results_frame, style='Card.TFrame')
         stats_frame.pack(fill=tk.X, pady=10)
 
         total = data.get('total_files', 0)
-        dups = data.get('duplicate_groups', 0)
-        moved = data.get('files_moved', 0)
+        unique = data.get('unique_files', 0)
+        exact_dups = data.get('total_exact_duplicates', 0)
+        superseded = data.get('total_superseded', 0)
+        storage_waste = data.get('storage_waste_mb', 0)
 
         ttk.Label(stats_frame, text=f"Total Files: {total}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
-        ttk.Label(stats_frame, text=f"Duplicate Groups: {dups}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
-        ttk.Label(stats_frame, text=f"Files Moved: {moved}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Unique: {unique}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Exact Duplicates: {exact_dups}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Superseded: {superseded}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
 
-        if dups == 0:
+        if exact_dups == 0 and superseded == 0:
             ttk.Label(self.dup_results_frame, text="No duplicates found!", style='Success.TLabel').pack(pady=20)
+        else:
+            # Show storage waste
+            if storage_waste > 0:
+                ttk.Label(self.dup_results_frame, text=f"Storage waste: {storage_waste} MB",
+                    style='Warning.TLabel').pack(pady=10)
 
     # ==========================================
     # TAB: VALIDATE NAMES
@@ -836,11 +853,20 @@ class HaciendaApp:
             ttk.Label(self.val_results_frame, text=f"Error: {error}", style='Error.TLabel').pack()
             return
 
-        data = result.get('body', result) if isinstance(result.get('body'), dict) else result
+        # Parse body if it's a string
+        data = result
+        if isinstance(result.get('body'), str):
+            try:
+                data = json.loads(result['body'])
+            except:
+                data = result
+        elif isinstance(result.get('body'), dict):
+            data = result['body']
 
         total = data.get('total_files', 0)
         valid = data.get('valid_count', 0)
         invalid = data.get('invalid_count', 0)
+        correctable = data.get('correctable_count', 0)
 
         stats_frame = ttk.Frame(self.val_results_frame, style='Card.TFrame')
         stats_frame.pack(fill=tk.X, pady=10)
@@ -849,9 +875,24 @@ class HaciendaApp:
         ttk.Label(stats_frame, text=f"Valid: {valid}", style='Success.TLabel').pack(side=tk.LEFT, padx=10)
         ttk.Label(stats_frame, text=f"Invalid: {invalid}",
             style='Error.TLabel' if invalid > 0 else 'Status.TLabel').pack(side=tk.LEFT, padx=10)
+        if correctable > 0:
+            ttk.Label(stats_frame, text=f"Correctable: {correctable}", style='Warning.TLabel').pack(side=tk.LEFT, padx=10)
 
         if invalid == 0:
             ttk.Label(self.val_results_frame, text="All files valid!", style='Success.TLabel').pack(pady=20)
+        else:
+            # Show invalid files
+            invalid_files = data.get('invalid_files', [])
+            if invalid_files:
+                ttk.Label(self.val_results_frame, text="Invalid Files:", style='Status.TLabel').pack(anchor=tk.W, pady=(10, 5))
+                for f in invalid_files[:10]:  # Show first 10
+                    fname = f.get('file_name', 'Unknown')
+                    err = f.get('error_message', '')
+                    ttk.Label(self.val_results_frame, text=f"  • {fname}: {err}",
+                        style='Info.TLabel', wraplength=500).pack(anchor=tk.W)
+                if len(invalid_files) > 10:
+                    ttk.Label(self.val_results_frame, text=f"  ... and {len(invalid_files) - 10} more",
+                        style='Info.TLabel').pack(anchor=tk.W)
 
     # ==========================================
     # TAB: CHECK COMPLETENESS
@@ -899,23 +940,54 @@ class HaciendaApp:
             ttk.Label(self.comp_results_frame, text=f"Error: {error}", style='Error.TLabel').pack()
             return
 
-        data = result.get('body', result) if isinstance(result.get('body'), dict) else result
+        # Parse body if it's a string
+        data = result
+        if isinstance(result.get('body'), str):
+            try:
+                data = json.loads(result['body'])
+            except:
+                data = result
+        elif isinstance(result.get('body'), dict):
+            data = result['body']
 
-        is_complete = data.get('is_complete', False)
-        total_dates = data.get('total_dates', 0)
-        complete_dates = data.get('complete_dates', 0)
-        missing = data.get('missing_count', 0)
+        total_files = data.get('total_files', 0)
+        entities_found = data.get('entities_found', 0)
+        complete_sets = data.get('complete_sets', 0)
+        incomplete_sets = data.get('incomplete_sets', 0)
+        completeness_pct = data.get('completeness_percentage', 0)
 
         stats_frame = ttk.Frame(self.comp_results_frame, style='Card.TFrame')
         stats_frame.pack(fill=tk.X, pady=10)
 
-        ttk.Label(stats_frame, text=f"Dates: {total_dates}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
-        ttk.Label(stats_frame, text=f"Complete: {complete_dates}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
-        ttk.Label(stats_frame, text=f"Missing Files: {missing}",
-            style='Error.TLabel' if missing > 0 else 'Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Files: {total_files}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Entities: {entities_found}", style='Status.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Complete: {complete_sets}", style='Success.TLabel').pack(side=tk.LEFT, padx=10)
+        ttk.Label(stats_frame, text=f"Incomplete: {incomplete_sets}",
+            style='Error.TLabel' if incomplete_sets > 0 else 'Status.TLabel').pack(side=tk.LEFT, padx=10)
 
-        if is_complete:
-            ttk.Label(self.comp_results_frame, text="All files present!", style='Success.TLabel').pack(pady=20)
+        # Completeness percentage
+        pct_style = 'Success.TLabel' if completeness_pct >= 100 else 'Warning.TLabel'
+        ttk.Label(self.comp_results_frame, text=f"Completeness: {completeness_pct:.1f}%",
+            style=pct_style).pack(pady=10)
+
+        if incomplete_sets == 0:
+            ttk.Label(self.comp_results_frame, text="All file sets complete!", style='Success.TLabel').pack(pady=10)
+        else:
+            # Show incomplete sets
+            file_sets = data.get('file_sets', [])
+            incomplete = [fs for fs in file_sets if not fs.get('is_complete', True)]
+            if incomplete:
+                ttk.Label(self.comp_results_frame, text="Incomplete Sets:", style='Status.TLabel').pack(anchor=tk.W, pady=(10, 5))
+                for fs in incomplete[:5]:  # Show first 5
+                    entity = fs.get('entity', 'Unknown')
+                    date = fs.get('date', '')
+                    missing = ', '.join(fs.get('missing_sources', []))
+                    ttk.Label(self.comp_results_frame,
+                        text=f"  • {entity} ({date}): Missing {missing}",
+                        style='Info.TLabel', wraplength=500).pack(anchor=tk.W)
+                if len(incomplete) > 5:
+                    ttk.Label(self.comp_results_frame, text=f"  ... and {len(incomplete) - 5} more",
+                        style='Info.TLabel').pack(anchor=tk.W)
 
     # ==========================================
     # TAB: FULL WORKFLOW
@@ -976,18 +1048,65 @@ class HaciendaApp:
 
         status = data.get('status', 'unknown')
         steps = data.get('steps', {})
+        has_errors = data.get('has_errors', False)
+        report_url = data.get('report_url')
+        report_name = data.get('report_name', 'validation_report.csv')
 
         # Status
-        status_style = 'Success.TLabel' if status == 'success' else 'Error.TLabel'
-        ttk.Label(self.wf_results_frame, text=f"Status: {status.upper()}", style=status_style).pack(pady=10)
+        status_style = 'Success.TLabel' if status == 'success' and not has_errors else 'Error.TLabel'
+        status_text = 'COMPLETED WITH ERRORS' if has_errors else status.upper()
+        ttk.Label(self.wf_results_frame, text=f"Status: {status_text}", style=status_style).pack(pady=10)
 
         # Steps
         for step_name, step_data in steps.items():
             step_frame = ttk.Frame(self.wf_results_frame, style='Card.TFrame')
             step_frame.pack(fill=tk.X, pady=5)
             step_status = step_data.get('status', 'unknown')
-            icon = "[OK]" if step_status == 'success' else "[!]"
-            ttk.Label(step_frame, text=f"{icon} {step_name}: {step_status}", style='Status.TLabel').pack(anchor=tk.W)
+            icon = "✓" if step_status == 'success' else "✗" if step_status == 'error' else "○"
+
+            # Add more details for each step
+            details = []
+            if 'total_files' in step_data:
+                details.append(f"Files: {step_data['total_files']}")
+            if 'duplicates_found' in step_data:
+                details.append(f"Duplicates: {step_data['duplicates_found']}")
+            if 'valid_files' in step_data:
+                details.append(f"Valid: {step_data['valid_files']}")
+            if 'invalid_files' in step_data:
+                details.append(f"Invalid: {step_data['invalid_files']}")
+            if 'complete_sets' in step_data:
+                details.append(f"Complete: {step_data['complete_sets']}")
+            if 'incomplete_sets' in step_data:
+                details.append(f"Incomplete: {step_data['incomplete_sets']}")
+
+            detail_text = f" ({', '.join(details)})" if details else ""
+            ttk.Label(step_frame, text=f"{icon} {step_name}: {step_status}{detail_text}",
+                style='Status.TLabel').pack(anchor=tk.W)
+
+        # Download Report Button (if report URL exists)
+        if report_url:
+            report_frame = ttk.Frame(self.wf_results_frame, style='Card.TFrame')
+            report_frame.pack(fill=tk.X, pady=15)
+
+            download_btn = tk.Button(report_frame, text="📥 Download Error Report",
+                command=lambda: self.download_report(report_url, report_name),
+                font=('Segoe UI', 11, 'bold'), bg=COLORS['warning'], fg='white',
+                activebackground='#c9302c', relief=tk.FLAT, cursor='hand2',
+                padx=20, pady=10)
+            download_btn.pack()
+
+            ttk.Label(report_frame, text=f"Report: {report_name}",
+                style='Info.TLabel').pack(pady=(5, 0))
+
+    def download_report(self, url, filename):
+        """Download a report file from URL."""
+        try:
+            # Open the presigned URL in default browser to download
+            webbrowser.open(url)
+            messagebox.showinfo("Download Started",
+                f"Report download started in your browser.\n\nFilename: {filename}")
+        except Exception as e:
+            messagebox.showerror("Download Error", f"Failed to download report: {e}")
 
     # ==========================================
     # TAB: LOAD TO SQL

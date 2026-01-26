@@ -181,6 +181,10 @@ Resources:
                 Resource: !Ref SftpCredentialsSecret
               - Effect: Allow
                 Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Hacienda_ERP_Test_MSSQL_text*'
+              - Effect: Allow
+                Action:
                   - dynamodb:PutItem
                   - dynamodb:GetItem
                   - dynamodb:UpdateItem
@@ -411,6 +415,150 @@ Resources:
           Properties:
             RestApiId: !Ref ApiGateway
             Path: /workflow/status/{jobId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # Integrated Validation Workflow
+  # ============================================================================
+
+  # Lambda function for integrated validation workflow (run-workflow)
+  IntegratedWorkflowFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-integrated-workflow-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.workflow_handler.run_validation_workflow_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          JOBS_TABLE: !Ref DownloadJobsTable
+          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+      Events:
+        RunIntegratedWorkflow:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /run-workflow
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # SQL Server Loading Functions
+  # ============================================================================
+
+  # Lambda function for SQL load preview
+  SqlPreviewFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sql-preview-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.sql_table_loader.preview_sql_load_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        PreviewSqlLoad:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /preview-load
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for SQL load execution
+  SqlLoadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sql-load-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.sql_table_loader.load_to_sql_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+      Events:
+        LoadToSql:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /load-to-sql
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # Stored Procedure Execution Functions
+  # ============================================================================
+
+  # Lambda function for running HCM_MAIN_INTF stored procedure
+  RunProcedureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-run-procedure-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.proc_runner_handler.run_stored_procedure_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+      Events:
+        RunProcedure:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /run-procedure
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # Lambda function for getting stored procedure status
+  ProcedureStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-procedure-status-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.proc_runner_handler.get_procedure_status_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+      Events:
+        GetProcedureStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /procedure-status
             Method: GET
             Auth:
               Authorizer: CognitoAuthorizer
