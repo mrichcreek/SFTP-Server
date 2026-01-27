@@ -944,6 +944,7 @@ def load_file_to_sql(
             db_cols_upper = {c.upper(): c for c in db_columns}
             col_indices = []  # List of (csv_index, db_column_name)
             skipped_cols = []
+            mapping_details = []  # Debug: show exactly what was mapped
 
             for i, csv_col in enumerate(headers):
                 csv_col_clean = csv_col.strip()
@@ -954,16 +955,21 @@ def load_file_to_sql(
                     # Verify the DB column exists
                     if db_col.upper() in db_cols_upper:
                         col_indices.append((i, db_cols_upper[db_col.upper()]))
+                        mapping_details.append(f"{csv_col_clean} -> {db_col} (mapped)")
                     else:
                         skipped_cols.append(f"{csv_col_clean} (mapped to {db_col} but not in DB)")
                 elif csv_col_clean.upper() in db_cols_upper:
                     # Direct match (no mapping needed)
                     col_indices.append((i, db_cols_upper[csv_col_clean.upper()]))
+                    mapping_details.append(f"{csv_col_clean} -> {csv_col_clean} (direct)")
                 else:
                     skipped_cols.append(csv_col_clean)
 
             result['columns_matched'] = len(col_indices)
             result['columns_skipped'] = skipped_cols
+            result['mapping_details'] = mapping_details
+            result['column_mapping_used'] = column_mapping
+            result['db_cols_upper'] = list(db_cols_upper.keys())
 
             if not col_indices:
                 result['error'] = f'No CSV columns could be mapped to database columns'
