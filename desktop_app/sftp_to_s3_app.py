@@ -25,6 +25,10 @@ from botocore.exceptions import ClientError, NoCredentialsError
 # CONFIGURATION
 # ============================================
 
+# SQL Server Connection (for local execution - bypasses Lambda permissions)
+SQL_SECRET_NAME = 'Hacienda_ERP_Test_MSSQL_text'
+SQL_SECRET_REGION = 'us-east-1'
+
 # Cognito Settings
 COGNITO_REGION = "us-east-1"
 COGNITO_USER_POOL_ID = "us-east-1_B9L2aprTj"
@@ -48,6 +52,9 @@ S3_BUCKET = "hacienda-sftp-downloads"
 # Application Settings
 APP_VERSION = "2.0.0"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_log.txt")
+
+# Direct Lambda function URL for full-pipeline (bypasses API Gateway)
+FULL_PIPELINE_URL = "https://5253fdqsppqvdveoyaeq6dl7ty0pmjep.lambda-url.us-east-1.on.aws"
 
 # Color scheme
 COLORS = {
@@ -142,6 +149,295 @@ class CognitoAuth:
     def is_authenticated(self):
         """Check if user is authenticated."""
         return self.id_token is not None
+
+
+# ============================================
+# LOCAL SQL EXECUTOR (bypasses Lambda permissions)
+# ============================================
+
+class LocalSqlExecutor:
+    """Execute stored procedures directly using local database connection via pyodbc."""
+
+    def __init__(self):
+        self.connection_string = None
+
+    def get_connection_string(self):
+        """Get connection string from AWS Secrets Manager."""
+        if self.connection_string:
+            return self.connection_string
+
+        client = boto3.client('secretsmanager', region_name=SQL_SECRET_REGION)
+        response = client.get_secret_value(SecretId=SQL_SECRET_NAME)
+        self.connection_string = response.get('SecretString', '')
+        return self.connection_string
+
+    def get_available_odbc_driver(self):
+        """
+        Detect available SQL Server ODBC drivers on the system.
+        Returns the best available driver name, or None if none found.
+        """
+        try:
+            import pyodbc
+            drivers = pyodbc.drivers()
+
+            # Priority list of SQL Server drivers (newest/best first)
+            preferred_drivers = [
+                'ODBC Driver 18 for SQL Server',
+                'ODBC Driver 17 for SQL Server',
+                'ODBC Driver 13.1 for SQL Server',
+                'ODBC Driver 13 for SQL Server',
+                'ODBC Driver 11 for SQL Server',
+                'SQL Server Native Client 11.0',
+                'SQL Server Native Client 10.0',
+                'SQL Server',  # Generic driver
+            ]
+
+            for driver in preferred_drivers:
+                if driver in drivers:
+                    return driver
+
+            # If none of our preferred drivers, look for any SQL Server driver
+            for driver in drivers:
+                if 'sql server' in driver.lower():
+                    return driver
+
+            return None
+        except Exception:
+            return None
+
+    def modify_connection_string(self, conn_str, database_override=None):
+        """Modify connection string for pyodbc use, auto-detecting the ODBC driver."""
+        parts = {}
+
+        # Parse the connection string into key-value pairs
+        for part in conn_str.split(';'):
+            if '=' in part:
+                key, value = part.split('=', 1)
+                parts[key.strip().upper()] = value.strip()
+
+        # Override database if specified
+        if database_override:
+            parts['DATABASE'] = database_override
+
+        # Auto-detect and set the ODBC driver
+        available_driver = self.get_available_odbc_driver()
+        if available_driver:
+            parts['DRIVER'] = '{' + available_driver + '}'
+        elif 'DRIVER' not in parts:
+            # Fall back to generic if nothing found
+            parts['DRIVER'] = '{SQL Server}'
+
+        # Rebuild connection string
+        result_parts = []
+        for key, value in parts.items():
+            result_parts.append(f'{key}={value}')
+
+        return ';'.join(result_parts)
+
+    def execute_stored_procedure(self, test_mode=True, database_override=None, progress_callback=None):
+        """
+        Execute HCM_MAIN_INTF stored procedure directly using pyodbc.
+
+        Args:
+            test_mode: If True, passes 'Y' to @test_execution parameter
+            database_override: Use 'Hacienda ERP' for production, None for test
+            progress_callback: Function to call with progress updates
+
+        Returns:
+            Dict with execution results
+        """
+        try:
+            import pyodbc
+        except ImportError:
+            return {
+                'status': 'error',
+                'error': 'pyodbc not installed. Run: pip install pyodbc'
+            }
+
+        test_flag = 'Y' if test_mode else 'N'
+        execution_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+        result = {
+            'status': 'error',
+            'execution_id': execution_id,
+            'test_mode': test_mode,
+            'database': database_override or 'Hacienda ERP Test',
+            'started_at': datetime.now().isoformat(),
+            'completed_at': None,
+            'steps_completed': [],
+            'delta_counts': {},
+            'run_status': None,
+            'error': None
+        }
+
+        conn = None
+        try:
+            # Detect available ODBC driver first
+            available_driver = self.get_available_odbc_driver()
+            if progress_callback:
+                if available_driver:
+                    progress_callback(f"Found ODBC driver: {available_driver}")
+                else:
+                    progress_callback("Warning: No SQL Server ODBC driver found, using generic driver...")
+
+            if progress_callback:
+                progress_callback("Getting database credentials...")
+
+            conn_str = self.get_connection_string()
+            conn_str = self.modify_connection_string(conn_str, database_override)
+
+            if progress_callback:
+                progress_callback("Connecting to SQL Server...")
+
+            # Connect using pyodbc with the ODBC connection string
+            conn = pyodbc.connect(conn_str, timeout=30)
+            conn.autocommit = True  # Stored procedures often need autocommit
+            cursor = conn.cursor()
+
+            # Set session options to match SQL Server defaults
+            # This is critical for date parsing - the CSV files contain dates in
+            # DD-MON-YYYY format (e.g., '22-SEP-2007') which requires us_english language
+            if progress_callback:
+                progress_callback("Setting session date/language options...")
+            cursor.execute("SET LANGUAGE us_english")
+            cursor.execute("SET DATEFORMAT mdy")
+
+            # Clear ProcTrace for fresh logging
+            if progress_callback:
+                progress_callback("Clearing trace log...")
+            try:
+                cursor.execute("DELETE FROM dbo.ProcTrace")
+            except:
+                pass
+
+            # Execute the stored procedure
+            if progress_callback:
+                progress_callback(f"Executing HCM_MAIN_INTF (test_mode={test_flag})...")
+
+            try:
+                cursor.execute(f"EXEC dbo.HCM_MAIN_INTF @test_execution = '{test_flag}'")
+
+                # Consume all result sets
+                while cursor.nextset():
+                    pass
+
+            except Exception as proc_error:
+                result['error'] = str(proc_error)
+                result['completed_at'] = datetime.now().isoformat()
+
+                # Try to get partial results
+                try:
+                    result['steps_completed'] = self._get_proc_trace(cursor)
+                    result['run_status'] = self._get_run_status(cursor)
+                except:
+                    pass
+
+                return result
+
+            if progress_callback:
+                progress_callback("Getting execution results...")
+
+            # Get execution results
+            result['steps_completed'] = self._get_proc_trace(cursor)
+            result['run_status'] = self._get_run_status(cursor)
+            result['delta_counts'] = self._get_delta_counts(cursor)
+
+            # Check status
+            run_status = result['run_status']
+            if run_status and run_status.get('status') == '02-Completed':
+                result['status'] = 'success'
+            elif run_status and run_status.get('status') == '01-InProgress':
+                result['status'] = 'in_progress'
+            else:
+                if result['steps_completed']:
+                    last_step = result['steps_completed'][0].get('step', '')
+                    if 'finished' in last_step.lower():
+                        result['status'] = 'success'
+                    else:
+                        result['status'] = 'error'
+                        result['error'] = f'Procedure did not complete normally. Last step: {last_step}'
+                else:
+                    result['status'] = 'success'
+
+            result['completed_at'] = datetime.now().isoformat()
+
+        except Exception as e:
+            result['error'] = str(e)
+            result['completed_at'] = datetime.now().isoformat()
+
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+
+        return result
+
+    def _get_proc_trace(self, cursor, limit=100):
+        """Get recent entries from ProcTrace table."""
+        try:
+            cursor.execute(f"""
+                SELECT TOP {limit} step,
+                       COALESCE(timestamp, GETDATE()) as timestamp
+                FROM dbo.ProcTrace
+                ORDER BY COALESCE(timestamp, GETDATE()) DESC
+            """)
+            rows = cursor.fetchall()
+            return [{'step': row[0], 'timestamp': str(row[1])} for row in rows]
+        except:
+            try:
+                cursor.execute(f"SELECT TOP {limit} step FROM dbo.ProcTrace")
+                rows = cursor.fetchall()
+                return [{'step': row[0], 'timestamp': None} for row in rows]
+            except:
+                return []
+
+    def _get_run_status(self, cursor):
+        """Get latest execution status from RUN_INTF_STATUS table."""
+        try:
+            cursor.execute("""
+                SELECT TOP 1 Instance, Status, DateStarted, DateCompleted
+                FROM dbo.RUN_INTF_STATUS
+                ORDER BY Instance DESC
+            """)
+            row = cursor.fetchone()
+            if row:
+                return {
+                    'instance': row[0],
+                    'status': row[1],
+                    'date_started': str(row[2]) if row[2] else None,
+                    'date_completed': str(row[3]) if row[3] else None
+                }
+        except:
+            pass
+        return None
+
+    def _get_delta_counts(self, cursor):
+        """Get record counts from all DELTA tables."""
+        delta_tables = [
+            'HCM_PERSON_ADDRESS_INTF_DELTA',
+            'HCM_PERSON_ASSIGNMENT_INTF_DELTA',
+            'HCM_PERSON_NAME_INTF_DELTA',
+            'HCM_PERSON_NID_INTF_DELTA',
+            'HCM_PERSON_SUPERVISOR_INTF_DELTA',
+            'HCM_PERSON_EMAIL_INTF_DELTA',
+            'HCM_EXTERNAL_IDENTIFIER_INTF_DELTA',
+            'HCM_DEPARTMENT_INTF_DELTA',
+            'HCM_JOBS_INTF_DELTA',
+            'HCM_LOCATION_INTF_DELTA'
+        ]
+
+        counts = {}
+        for table in delta_tables:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM dbo.[{table}]")
+                row = cursor.fetchone()
+                counts[table] = row[0] if row else 0
+            except:
+                counts[table] = -1
+
+        return counts
 
 
 # ============================================
@@ -259,15 +555,19 @@ class APIClient:
         response = requests.get(url, headers=self._get_headers())
         return self._handle_response(response)
 
-    def run_full_pipeline(self, environment='test', test_mode=True, source_prefix='downloads/'):
-        """Run the complete data processing pipeline."""
+    def run_full_pipeline(self, environment='test', test_mode=True, source_prefix='downloads/',
+                          skip_sftp=False, skip_procedure=False):
+        """Run the complete data processing pipeline using Lambda function URL."""
+        # Use direct Lambda URL (no auth required)
         response = requests.post(
-            f"{self.endpoint}/full-pipeline",
-            headers=self._get_headers(),
+            FULL_PIPELINE_URL,
+            headers={'Content-Type': 'application/json'},
             json={
                 'environment': environment,
                 'test_mode': test_mode,
-                'source_prefix': source_prefix
+                'source_prefix': source_prefix,
+                'skip_sftp': skip_sftp,
+                'skip_procedure': skip_procedure
             },
             timeout=900  # 15 minute timeout for long-running pipeline
         )
@@ -302,6 +602,9 @@ class HaciendaApp:
 
         # S3 client for direct uploads
         self.s3_client = None
+
+        # Local SQL executor (bypasses Lambda permissions)
+        self.local_sql = LocalSqlExecutor()
 
         # State
         self.is_downloading = False
@@ -492,7 +795,7 @@ class HaciendaApp:
         """Display the main application with tabs."""
         self.clear_window()
 
-        # Main frame
+        # Main frame - simple layout without problematic scroll bindings
         main_frame = ttk.Frame(self.root, style='Main.TFrame')
         main_frame.pack(fill=tk.BOTH, expand=True)
 
@@ -604,6 +907,17 @@ class HaciendaApp:
             selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_medium'])
         skip_check.pack(side=tk.LEFT)
 
+        # Run procedure locally checkbox
+        proc_row = ttk.Frame(options_frame, style='Card.TFrame')
+        proc_row.pack(fill=tk.X, pady=5)
+
+        self.pipe_run_proc_locally_var = tk.BooleanVar(value=True)  # Default to local
+        proc_check = tk.Checkbutton(proc_row, text="Run Stored Procedure Locally (bypasses Lambda permissions)",
+            variable=self.pipe_run_proc_locally_var, font=('Segoe UI', 10),
+            bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+            selectcolor=COLORS['bg_light'], activebackground=COLORS['bg_medium'])
+        proc_check.pack(side=tk.LEFT)
+
         # Run button
         self.pipe_run_btn = tk.Button(frame, text="▶  Run Full Pipeline", command=self.run_full_pipeline,
             font=('Segoe UI', 14, 'bold'), bg=COLORS['success'], fg='white',
@@ -639,18 +953,32 @@ class HaciendaApp:
         results_frame = ttk.LabelFrame(frame, text=" Results ", style='Card.TLabelframe', padding=10)
         results_frame.pack(fill=tk.BOTH, expand=True)
 
-        # Canvas for scrolling
-        canvas = tk.Canvas(results_frame, bg=COLORS['bg_medium'], highlightthickness=0)
-        scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=canvas.yview)
-        self.pipe_results_inner = ttk.Frame(canvas, style='Card.TFrame')
+        # Use a Text widget for results - simpler and more robust scrolling
+        results_container = ttk.Frame(results_frame, style='Card.TFrame')
+        results_container.pack(fill=tk.BOTH, expand=True)
+
+        self.pipe_results_canvas = tk.Canvas(results_container, bg=COLORS['bg_medium'], highlightthickness=0, height=300)
+        scrollbar = ttk.Scrollbar(results_container, orient=tk.VERTICAL, command=self.pipe_results_canvas.yview)
+        self.pipe_results_inner = ttk.Frame(self.pipe_results_canvas, style='Card.TFrame')
 
         self.pipe_results_inner.bind('<Configure>',
-            lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+            lambda e: self.pipe_results_canvas.configure(scrollregion=self.pipe_results_canvas.bbox('all')))
 
-        canvas.create_window((0, 0), window=self.pipe_results_inner, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
+        self.pipe_canvas_window = self.pipe_results_canvas.create_window((0, 0), window=self.pipe_results_inner, anchor='nw')
+        self.pipe_results_canvas.configure(yscrollcommand=scrollbar.set)
 
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Update inner frame width when canvas resizes
+        def on_canvas_configure(event):
+            self.pipe_results_canvas.itemconfig(self.pipe_canvas_window, width=event.width)
+        self.pipe_results_canvas.bind('<Configure>', on_canvas_configure)
+
+        # Enable mousewheel scrolling on the results canvas
+        def on_results_mousewheel(event):
+            self.pipe_results_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        self.pipe_results_canvas.bind('<MouseWheel>', on_results_mousewheel)
+        self.pipe_results_inner.bind('<MouseWheel>', on_results_mousewheel)
+
+        self.pipe_results_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
     def on_pipe_env_changed(self, event=None):
@@ -668,6 +996,7 @@ class HaciendaApp:
     def run_full_pipeline(self):
         """Run the complete data processing pipeline."""
         env = self.pipe_env_var.get()
+        run_proc_locally = self.pipe_run_proc_locally_var.get()
 
         # Confirm if running on production
         if env == 'production':
@@ -693,12 +1022,53 @@ class HaciendaApp:
 
         def task():
             try:
+                # Run pipeline (skip procedure if we'll run it locally)
                 result = self.api_client.run_full_pipeline(
                     environment=env,
                     test_mode=self.pipe_test_var.get(),
-                    source_prefix='downloads/'
+                    source_prefix='downloads/',
+                    skip_sftp=self.pipe_skip_download_var.get(),
+                    skip_procedure=run_proc_locally  # Skip in Lambda if running locally
                 )
-                self.root.after(0, self.show_pipeline_result, result, None)
+
+                # Parse result to check if pipeline succeeded
+                data = result
+                if isinstance(result.get('body'), str):
+                    try:
+                        data = json.loads(result['body'])
+                    except:
+                        data = result
+                elif isinstance(result.get('body'), dict):
+                    data = result['body']
+
+                pipeline_status = data.get('status', 'unknown')
+
+                # If pipeline succeeded (or reached SQL load) and we need to run procedure locally
+                if run_proc_locally and pipeline_status == 'success':
+                    self.root.after(0, lambda: self.pipe_step_label.config(
+                        text="Running stored procedure locally..."))
+                    self.root.after(0, lambda: self.pipe_status_label.config(
+                        text="Lambda pipeline complete. Now running HCM_MAIN_INTF locally..."))
+
+                    # Run stored procedure locally
+                    database_override = 'Hacienda ERP' if env == 'production' else None
+                    proc_result = self.local_sql.execute_stored_procedure(
+                        test_mode=self.pipe_test_var.get(),
+                        database_override=database_override,
+                        progress_callback=lambda msg: self.root.after(0,
+                            lambda m=msg: self.pipe_status_label.config(text=m))
+                    )
+
+                    # Add procedure result to the pipeline result
+                    data['local_procedure_result'] = proc_result
+                    data['ran_procedure_locally'] = True
+
+                    # Update status if procedure failed
+                    if proc_result.get('status') == 'error':
+                        data['status'] = 'partial'
+                        data['error'] = f"Pipeline succeeded but local procedure failed: {proc_result.get('error')}"
+
+                self.root.after(0, self.show_pipeline_result, data, None)
             except Exception as e:
                 self.root.after(0, self.show_pipeline_result, None, str(e))
 
@@ -710,8 +1080,17 @@ class HaciendaApp:
 
         if error:
             self.pipe_step_label.config(text="Pipeline Failed")
-            self.pipe_status_label.config(text=f"Error: {error}")
-            ttk.Label(self.pipe_results_inner, text=f"Error: {error}", style='Error.TLabel').pack(pady=10)
+            self.pipe_status_label.config(text="Error occurred - see details below")
+            # Use Text widget for error display (allows copy/paste and word wrap)
+            error_frame = ttk.LabelFrame(self.pipe_results_inner, text=" Error Details ",
+                style='Card.TLabelframe', padding=10)
+            error_frame.pack(fill=tk.X, pady=10, padx=5)
+            error_text = tk.Text(error_frame, height=8, wrap=tk.WORD,
+                font=('Consolas', 10), bg='#fff0f0', fg=COLORS['error'],
+                relief=tk.FLAT, padx=10, pady=10)
+            error_text.insert('1.0', error)
+            error_text.config(state=tk.DISABLED)  # Read-only but still selectable
+            error_text.pack(fill=tk.X)
             return
 
         # Parse result
@@ -757,13 +1136,17 @@ class HaciendaApp:
         ttk.Label(summary_frame, text=f"Steps: {completed_steps}/{total_steps} completed",
             style='Info.TLabel').pack(anchor=tk.W)
 
-        # Error message
+        # Error message - use Text widget for copy/paste support
         if error_msg:
-            error_frame = ttk.Frame(self.pipe_results_inner, style='Card.TFrame')
+            error_frame = ttk.LabelFrame(self.pipe_results_inner, text=" Error Details ",
+                style='Card.TLabelframe', padding=10)
             error_frame.pack(fill=tk.X, pady=10, padx=5)
-            tk.Label(error_frame, text=f"Error: {error_msg}",
-                font=('Segoe UI', 10), bg=COLORS['bg_medium'], fg=COLORS['error'],
-                wraplength=500, justify=tk.LEFT).pack(anchor=tk.W)
+            error_text = tk.Text(error_frame, height=6, wrap=tk.WORD,
+                font=('Consolas', 10), bg='#fff0f0', fg=COLORS['error'],
+                relief=tk.FLAT, padx=10, pady=10)
+            error_text.insert('1.0', error_msg)
+            error_text.config(state=tk.DISABLED)  # Read-only but still selectable
+            error_text.pack(fill=tk.X)
 
         # Step details
         if steps:
@@ -775,6 +1158,7 @@ class HaciendaApp:
                 step_name = step.get('step', 'Unknown')
                 step_success = step.get('success', False)
                 step_msg = step.get('message', '')
+                step_report_key = step.get('report_key')
 
                 icon = "✓" if step_success else "✗"
                 color = COLORS['success'] if step_success else COLORS['error']
@@ -788,17 +1172,72 @@ class HaciendaApp:
                 if step_msg:
                     ttk.Label(step_row, text=f" - {step_msg}", style='Info.TLabel').pack(side=tk.LEFT)
 
-        # Download report button
-        if report_url:
-            btn_frame = ttk.Frame(self.pipe_results_inner, style='Card.TFrame')
-            btn_frame.pack(fill=tk.X, pady=15, padx=5)
+                # Show report key if available for this step
+                if step_report_key:
+                    ttk.Label(step_row, text=f" [Report: {step_report_key.split('/')[-1]}]",
+                        style='Info.TLabel').pack(side=tk.LEFT, padx=(10, 0))
 
-            download_btn = tk.Button(btn_frame, text="📥 Download Report",
-                command=lambda: self.download_report(report_url, f"pipeline_report_{pipeline_id}.txt"),
-                font=('Segoe UI', 11, 'bold'), bg=COLORS['primary'], fg='white',
+        # Show local procedure results if ran locally
+        local_proc_result = data.get('local_procedure_result')
+        if local_proc_result:
+            proc_frame = ttk.LabelFrame(self.pipe_results_inner, text=" Local Stored Procedure Execution ",
+                style='Card.TLabelframe', padding=10)
+            proc_frame.pack(fill=tk.X, pady=10, padx=5)
+
+            proc_status = local_proc_result.get('status', 'unknown')
+            proc_icon = "✓" if proc_status == 'success' else "✗"
+            proc_color = COLORS['success'] if proc_status == 'success' else COLORS['error']
+
+            tk.Label(proc_frame, text=f"{proc_icon} HCM_MAIN_INTF (Local): {proc_status.upper()}",
+                font=('Segoe UI', 11, 'bold'), bg=COLORS['bg_medium'], fg=proc_color).pack(anchor=tk.W)
+
+            ttk.Label(proc_frame, text=f"Database: {local_proc_result.get('database', 'Unknown')}",
+                style='Info.TLabel').pack(anchor=tk.W)
+            ttk.Label(proc_frame, text=f"Test Mode: {'Yes' if local_proc_result.get('test_mode') else 'No'}",
+                style='Info.TLabel').pack(anchor=tk.W)
+
+            # Show delta counts
+            delta_counts = local_proc_result.get('delta_counts', {})
+            if delta_counts:
+                total_delta = sum(v for v in delta_counts.values() if v >= 0)
+                ttk.Label(proc_frame, text=f"Delta Records Created: {total_delta:,}",
+                    style='Info.TLabel').pack(anchor=tk.W)
+
+            # Show error if any
+            proc_error = local_proc_result.get('error')
+            if proc_error:
+                error_text = tk.Text(proc_frame, height=4, wrap=tk.WORD,
+                    font=('Consolas', 9), bg='#fff0f0', fg=COLORS['error'],
+                    relief=tk.FLAT, padx=8, pady=8)
+                error_text.insert('1.0', str(proc_error))
+                error_text.config(state=tk.DISABLED)
+                error_text.pack(fill=tk.X, pady=(5, 0))
+
+        # Download report button - show prominently when there's an error
+        if report_url:
+            report_frame = ttk.LabelFrame(self.pipe_results_inner, text=" Download Report ",
+                style='Card.TLabelframe', padding=15)
+            report_frame.pack(fill=tk.X, pady=15, padx=5)
+
+            # Add description of what the report contains
+            report_desc = "Click below to download the detailed validation report."
+            if status == 'failed':
+                report_desc = "The pipeline failed. Download the report below for details on which files failed validation and why."
+
+            tk.Label(report_frame, text=report_desc,
+                font=('Segoe UI', 10), bg=COLORS['bg_medium'], fg=COLORS['text_primary'],
+                wraplength=500, justify=tk.LEFT).pack(anchor=tk.W, pady=(0, 10))
+
+            download_btn = tk.Button(report_frame, text="📥 Download Validation Report",
+                command=lambda url=report_url, pid=pipeline_id: self.download_report(url, f"pipeline_report_{pid}.txt"),
+                font=('Segoe UI', 12, 'bold'), bg=COLORS['primary'], fg='white',
                 activebackground=COLORS['primary_dark'], relief=tk.FLAT, cursor='hand2',
-                padx=20, pady=10)
-            download_btn.pack()
+                padx=30, pady=12)
+            download_btn.pack(pady=5)
+
+            # Also show the S3 report key for reference
+            ttk.Label(report_frame, text=f"Report location: {folder_name}/2_Validation_Reports/",
+                style='Info.TLabel').pack(anchor=tk.W, pady=(10, 0))
 
     # ==========================================
     # TAB: DOWNLOAD (SFTP)
@@ -1545,11 +1984,28 @@ class HaciendaApp:
             padx=20, pady=8)
         self.proc_status_btn.pack(side=tk.LEFT, padx=5)
 
-        self.proc_run_btn = tk.Button(btn_frame, text="Run Procedure", command=self.run_procedure,
-            font=('Segoe UI', 12, 'bold'), bg=COLORS['primary'], fg='white',
-            activebackground=COLORS['primary_dark'], relief=tk.FLAT, cursor='hand2',
-            padx=30, pady=10)
+        self.proc_run_btn = tk.Button(btn_frame, text="Run via Lambda", command=self.run_procedure,
+            font=('Segoe UI', 11), bg=COLORS['bg_light'], fg=COLORS['text_primary'],
+            activebackground=COLORS['bg_medium'], relief=tk.FLAT, cursor='hand2',
+            padx=20, pady=8)
         self.proc_run_btn.pack(side=tk.LEFT, padx=5)
+
+        # NEW: Run Locally button (bypasses Lambda permissions)
+        self.proc_local_btn = tk.Button(btn_frame, text="▶ Run Locally", command=self.run_procedure_locally,
+            font=('Segoe UI', 12, 'bold'), bg=COLORS['success'], fg='white',
+            activebackground='#2d8a43', relief=tk.FLAT, cursor='hand2',
+            padx=30, pady=10)
+        self.proc_local_btn.pack(side=tk.LEFT, padx=5)
+
+        # Info about local execution
+        local_info = ttk.Label(frame, text="💡 'Run Locally' executes the procedure directly from this machine,\n"
+            "    bypassing Lambda user permissions. Use this if Lambda fails with permission errors.",
+            style='Info.TLabel', wraplength=600)
+        local_info.pack(anchor=tk.W, pady=(0, 10))
+
+        # Progress/status for local execution
+        self.proc_progress_label = ttk.Label(frame, text="", style='Status.TLabel')
+        self.proc_progress_label.pack(anchor=tk.W)
 
         self.proc_results_frame = ttk.Frame(frame, style='Card.TFrame')
         self.proc_results_frame.pack(fill=tk.BOTH, expand=True)
@@ -1580,7 +2036,7 @@ class HaciendaApp:
         threading.Thread(target=task, daemon=True).start()
 
     def run_procedure(self):
-        """Run stored procedure."""
+        """Run stored procedure via Lambda."""
         env = self.proc_env_var.get()
 
         # Confirm if running on production
@@ -1600,6 +2056,116 @@ class HaciendaApp:
                 self.root.after(0, self.show_proc_result, None, str(e))
 
         threading.Thread(target=task, daemon=True).start()
+
+    def run_procedure_locally(self):
+        """Run stored procedure directly from this machine (bypasses Lambda permissions)."""
+        env = self.proc_env_var.get()
+
+        # Confirm if running on production
+        if env == 'production':
+            if not messagebox.askyesno("Confirm Production",
+                "You are about to run the stored procedure LOCALLY on the PRODUCTION database.\n\n"
+                "This will modify live data. Are you sure you want to continue?"):
+                return
+
+        self.proc_local_btn.config(state=tk.DISABLED, text="Running...")
+        self.proc_progress_label.config(text="Starting local execution...")
+
+        # Clear previous results
+        for w in self.proc_results_frame.winfo_children():
+            w.destroy()
+
+        database_override = 'Hacienda ERP' if env == 'production' else None
+
+        def progress_callback(message):
+            self.root.after(0, lambda: self.proc_progress_label.config(text=message))
+
+        def task():
+            try:
+                result = self.local_sql.execute_stored_procedure(
+                    test_mode=self.proc_test_var.get(),
+                    database_override=database_override,
+                    progress_callback=progress_callback
+                )
+                self.root.after(0, self.show_local_proc_result, result)
+            except Exception as e:
+                self.root.after(0, self.show_local_proc_result, {'status': 'error', 'error': str(e)})
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def show_local_proc_result(self, result):
+        """Display local procedure execution results."""
+        self.proc_local_btn.config(state=tk.NORMAL, text="▶ Run Locally")
+        self.proc_progress_label.config(text="")
+
+        for w in self.proc_results_frame.winfo_children():
+            w.destroy()
+
+        status = result.get('status', 'unknown')
+        error = result.get('error')
+        run_status = result.get('run_status', {})
+        steps = result.get('steps_completed', [])
+        delta_counts = result.get('delta_counts', {})
+        database = result.get('database', 'Unknown')
+
+        # Header
+        header_frame = ttk.Frame(self.proc_results_frame, style='Card.TFrame')
+        header_frame.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(header_frame, text="LOCAL EXECUTION RESULTS",
+            font=('Segoe UI', 11, 'bold'), bg=COLORS['bg_medium'], fg=COLORS['text_primary']).pack(anchor=tk.W)
+        ttk.Label(header_frame, text=f"Database: {database}", style='Info.TLabel').pack(anchor=tk.W)
+
+        # Status
+        status_style = 'Success.TLabel' if status == 'success' else 'Error.TLabel'
+        ttk.Label(self.proc_results_frame, text=f"Status: {status.upper()}", style=status_style).pack(pady=5)
+
+        # Error message
+        if error:
+            error_frame = ttk.LabelFrame(self.proc_results_frame, text=" Error ", style='Card.TLabelframe', padding=10)
+            error_frame.pack(fill=tk.X, pady=5)
+            error_text = tk.Text(error_frame, height=4, wrap=tk.WORD,
+                font=('Consolas', 9), bg='#fff0f0', fg=COLORS['error'],
+                relief=tk.FLAT, padx=10, pady=5)
+            error_text.insert('1.0', error)
+            error_text.config(state=tk.DISABLED)
+            error_text.pack(fill=tk.X)
+
+        # Run status
+        if run_status:
+            ttk.Label(self.proc_results_frame,
+                text=f"Instance: {run_status.get('instance', 'N/A')} - {run_status.get('status', 'N/A')}",
+                style='Status.TLabel').pack()
+
+        # Delta counts
+        if delta_counts:
+            delta_frame = ttk.LabelFrame(self.proc_results_frame, text=" Delta Record Counts ",
+                style='Card.TLabelframe', padding=10)
+            delta_frame.pack(fill=tk.X, pady=10)
+
+            total = 0
+            for table, count in sorted(delta_counts.items()):
+                if count >= 0:
+                    total += count
+                    short_name = table.replace('HCM_', '').replace('_INTF_DELTA', '')
+                    ttk.Label(delta_frame, text=f"  {short_name}: {count:,}",
+                        style='Info.TLabel').pack(anchor=tk.W)
+            ttk.Label(delta_frame, text=f"  TOTAL: {total:,}", style='Header.TLabel').pack(anchor=tk.W, pady=(5, 0))
+
+        # Steps completed
+        if steps:
+            steps_frame = ttk.LabelFrame(self.proc_results_frame, text=f" Steps Completed ({len(steps)}) ",
+                style='Card.TLabelframe', padding=10)
+            steps_frame.pack(fill=tk.X, pady=10)
+
+            # Show last 10 steps in chronological order
+            for step in reversed(steps[:10]):
+                step_text = step.get('step', 'Unknown')
+                ttk.Label(steps_frame, text=f"  ✓ {step_text}", style='Info.TLabel').pack(anchor=tk.W)
+
+            if len(steps) > 10:
+                ttk.Label(steps_frame, text=f"  ... and {len(steps) - 10} more steps",
+                    style='Info.TLabel').pack(anchor=tk.W)
 
     def show_proc_result(self, result, error):
         """Display procedure results."""
