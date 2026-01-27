@@ -254,7 +254,8 @@ COLUMN_MAPPINGS = {
         'HIRE_DT': 'HIRE_DATE',
         'EFFDT': 'EFFECTIVE_DATE',
         'EFFSEQ': 'EFFECTIVE_SEQUENCE',
-        'EMPL_STATUS': 'ASSIGNMENT_STATUS_TYPE',
+        # Note: CSV has ASSIGNMENT_STATUS_TYPE directly, don't map EMPL_STATUS
+        'ASSIGNMENT_STATUS_TYPE': 'ASSIGNMENT_STATUS_TYPE',
         'BUSINESS_UNIT': 'BUSINESS_UNIT',
         'LOCATION': 'LOCATION_CODE',
         'ACTION': 'ACTION_CODE',
@@ -290,7 +291,8 @@ COLUMN_MAPPINGS = {
         'REHIRE_RECOMMENDATION': 'REHIRE_RECOMMENDATION',
         'EFFDT': 'EFFECTIVE_DATE',
         'EFFSEQ': 'EFFECTIVE_SEQUENCE',
-        'EMPL_STATUS': 'ASSIGNMENT_STATUS_TYPE',
+        # Note: CSV has ASSIGNMENT_STATUS_TYPE directly, don't map EMPL_STATUS
+        'ASSIGNMENT_STATUS_TYPE': 'ASSIGNMENT_STATUS_TYPE',
         'BUSINESS_UNIT': 'BUSINESS_UNIT',
         'LOCATION': 'LOCATION_CODE',
         'ACTION': 'ACTION_CODE',
@@ -643,6 +645,25 @@ COLUMN_MAPPINGS = {
         'EMAIL_ADDRESS': 'EMAIL_ADDRESS',
         'PRIMARY_FLAG': 'PRIMARY_FLAG',
         'SOURCE_SYSTEM_OWNER': 'SOURCE_SYSTEM_OWNER',
+    },
+
+    # =========================================================================
+    # HCM_SENIORITY_INTF - Seniority file
+    # =========================================================================
+    ('HCM_SENIORITY_INTF', 'RHUM'): {
+        'PERSON_NUMBER': 'PERSON_NUMBER',
+        'SENIORITY_DATE_CODE': 'SENIORITY_DATE_CODE',
+        'ENTRY_DATE': 'ENTRY_DATE',
+    },
+    ('HCM_SENIORITY_INTF', 'FIMAS'): {
+        'PERSON_NUMBER': 'PERSON_NUMBER',
+        'SENIORITY_DATE_CODE': 'SENIORITY_DATE_CODE',
+        'ENTRY_DATE': 'ENTRY_DATE',
+    },
+    ('HCM_SENIORITY_INTF', 'HACIENDA'): {
+        'PERSON_NUMBER': 'PERSON_NUMBER',
+        'SENIORITY_DATE_CODE': 'SENIORITY_DATE_CODE',
+        'ENTRY_DATE': 'ENTRY_DATE',
     },
 }
 
