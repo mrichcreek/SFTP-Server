@@ -26,10 +26,13 @@ All files are organized in timestamped S3 folders:
 import boto3
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from enum import Enum
+
+# Puerto Rico timezone (UTC-4, no daylight saving time)
+PR_TIMEZONE = timezone(timedelta(hours=-4))
 
 # Import existing modules
 try:
@@ -48,6 +51,7 @@ try:
     from .stored_procedure_runner import execute_hcm_main_intf
     from .delta_exporter import DeltaExporter
     from .sftp_uploader import SftpUploader
+    from .sftp_downloader import SftpDownloader, download_from_sftp
 except ImportError:
     from sftp_download.duplicate_detector import detect_and_move_duplicates
     from sftp_download.completeness_checker import (
@@ -64,6 +68,7 @@ except ImportError:
     from sftp_download.stored_procedure_runner import execute_hcm_main_intf
     from sftp_download.delta_exporter import DeltaExporter
     from sftp_download.sftp_uploader import SftpUploader
+    from sftp_download.sftp_downloader import SftpDownloader, download_from_sftp
 
 
 class PipelineStep(Enum):
@@ -147,9 +152,11 @@ class FullPipelineOrchestrator:
         'initial': '1_Initial_Files',
         'validation': '2_Validation_Reports',
         'load': '3_Load_Reports',
-        'post_load': '4_Post_Load_Reports',
-        'export': '5_Export_Files',
-        'upload': '6_Upload_Reports'
+        'invalid': '4_InvalidFiles',
+        'invalid_schema': '5_InvalidSchema',
+        'delta': '6_Delta_Files',
+        'export': '7_Export_Files',
+        'upload': '8_Upload_Reports'
     }
 
     # Steps in execution order with their weights for progress calculation
@@ -179,8 +186,9 @@ class FullPipelineOrchestrator:
         self.s3_client = boto3.client('s3', region_name=region)
 
     def _create_timestamped_folder(self) -> str:
-        """Create a timestamped folder name."""
-        return datetime.now().strftime('%Y%m%d_%H%M')
+        """Create a timestamped folder name using Puerto Rico time (UTC-4)."""
+        pr_time = datetime.now(PR_TIMEZONE)
+        return pr_time.strftime('%Y%m%d_%H%M')
 
     def _get_folder_path(self, base_folder: str, subfolder: str) -> str:
         """Get the full S3 prefix for a subfolder."""
@@ -342,7 +350,9 @@ class FullPipelineOrchestrator:
         source_prefix: str = 'downloads/',
         skip_download: bool = True,  # Skip SFTP download for now - use existing files
         skip_procedure: bool = False,  # Skip stored procedure (run locally from desktop app)
-        on_progress: Optional[Callable[[str, int, str], None]] = None
+        skip_sftp_upload: bool = False,  # Skip SFTP upload (run locally from desktop app with VPN)
+        on_progress: Optional[Callable[[str, int, str], None]] = None,
+        sftp_download_config: Optional[Dict] = None  # SFTP download credentials from desktop app
     ) -> PipelineResult:
         """
         Run the complete data processing pipeline.
@@ -353,7 +363,9 @@ class FullPipelineOrchestrator:
             source_prefix: S3 prefix where source files are located
             skip_download: If True, skip SFTP download (use existing S3 files)
             skip_procedure: If True, skip stored procedure step (to run locally)
+            skip_sftp_upload: If True, skip SFTP upload step (to run locally with VPN access)
             on_progress: Callback function(step_name, percent, message)
+            sftp_download_config: Dict with SFTP credentials {host, port, user, password, folder}
 
         Returns:
             PipelineResult with all execution details
@@ -392,7 +404,10 @@ class FullPipelineOrchestrator:
         # Determine database based on environment
         database_override = None
         if environment == 'production':
-            database_override = 'Hacienda ERP'
+            database_override = 'Hacienda_ERP'
+        elif environment == 'intf':
+            database_override = 'Hacienda_ERP_INTF'
+        # else: uses default from connection string (Hacienda_ERP_Test)
 
         folders = {}
 
@@ -409,25 +424,86 @@ class FullPipelineOrchestrator:
                 completed_at=datetime.now().isoformat()
             ))
 
-            # Step 2: SFTP Download (skip for now)
+            # Step 2: SFTP Download
             update_progress(PipelineStep.SFTP_DOWNLOAD, "Downloading files from SFTP...")
+            started = datetime.now().isoformat()
+
             if skip_download:
                 complete_step(PipelineStep.SFTP_DOWNLOAD, StepResult(
                     step=PipelineStep.SFTP_DOWNLOAD.value,
                     success=True,
                     message="SFTP download skipped - using existing S3 files",
-                    started_at=datetime.now().isoformat(),
+                    started_at=started,
                     completed_at=datetime.now().isoformat()
                 ))
             else:
-                # TODO: Implement actual SFTP download
-                complete_step(PipelineStep.SFTP_DOWNLOAD, StepResult(
-                    step=PipelineStep.SFTP_DOWNLOAD.value,
-                    success=True,
-                    message="SFTP download not yet implemented",
-                    started_at=datetime.now().isoformat(),
-                    completed_at=datetime.now().isoformat()
-                ))
+                # Perform actual SFTP download from Sterling server
+                try:
+                    # Get SFTP credentials from config (passed from desktop app) or environment
+                    sftp_config = sftp_download_config or {}
+                    sftp_host = sftp_config.get('host') or os.environ.get('SFTP_DOWNLOAD_HOST', '10.3.3.146')
+                    sftp_port = int(sftp_config.get('port') or os.environ.get('SFTP_DOWNLOAD_PORT', 22))
+                    sftp_user = sftp_config.get('user') or os.environ.get('SFTP_DOWNLOAD_USER', 'gprerpusr')
+                    sftp_password = sftp_config.get('password') or os.environ.get('SFTP_DOWNLOAD_PASSWORD')
+                    sftp_secret = os.environ.get('SFTP_DOWNLOAD_SECRET')  # AWS secret (fallback)
+                    remote_folder = sftp_config.get('folder') or os.environ.get('SFTP_DOWNLOAD_FOLDER', '/OCI/HCM/OUTPUT/')
+
+                    downloader = SftpDownloader(
+                        bucket=self.bucket,
+                        sftp_secret_name=sftp_secret if not sftp_password else None,
+                        sftp_host=sftp_host,
+                        sftp_port=sftp_port,
+                        sftp_user=sftp_user,
+                        sftp_password=sftp_password,
+                        remote_folder=remote_folder
+                    )
+
+                    # Download all files to the source prefix
+                    download_result = downloader.download_all(
+                        s3_prefix=source_prefix,
+                        progress_callback=lambda done, total, fname:
+                            update_progress(PipelineStep.SFTP_DOWNLOAD,
+                                f"Downloading {done+1}/{total}: {fname}")
+                    )
+
+                    if not download_result.get('success'):
+                        complete_step(PipelineStep.SFTP_DOWNLOAD, StepResult(
+                            step=PipelineStep.SFTP_DOWNLOAD.value,
+                            success=False,
+                            message=f"SFTP download failed: {download_result.get('error', 'Unknown error')}",
+                            details=download_result,
+                            started_at=started,
+                            completed_at=datetime.now().isoformat()
+                        ))
+
+                        result.status = 'failed'
+                        result.error = f"SFTP download failed: {download_result.get('error', 'Unknown error')}"
+                        result.completed_at = datetime.now().isoformat()
+                        return result
+
+                    complete_step(PipelineStep.SFTP_DOWNLOAD, StepResult(
+                        step=PipelineStep.SFTP_DOWNLOAD.value,
+                        success=True,
+                        message=f"Downloaded {download_result.get('files_downloaded', 0)} files from SFTP ({download_result.get('total_bytes', 0):,} bytes)",
+                        details=download_result,
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+
+                except Exception as download_error:
+                    complete_step(PipelineStep.SFTP_DOWNLOAD, StepResult(
+                        step=PipelineStep.SFTP_DOWNLOAD.value,
+                        success=False,
+                        message=f"SFTP download failed: {str(download_error)}",
+                        details={'error': str(download_error)},
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+
+                    result.status = 'failed'
+                    result.error = f"SFTP download failed: {str(download_error)}"
+                    result.completed_at = datetime.now().isoformat()
+                    return result
 
             # Step 3: Create folder structure
             update_progress(PipelineStep.CREATE_FOLDERS, "Creating folder structure...")
@@ -477,10 +553,15 @@ class FullPipelineOrchestrator:
             # Refresh file list after duplicates moved
             files = self._list_initial_files(folders['initial'])
 
+            # Calculate totals for message
+            exact_dups = dup_result.get('total_exact_duplicates', 0)
+            superseded = dup_result.get('total_superseded', 0)
+            total_moved = dup_result.get('total_moved', exact_dups + superseded)
+
             complete_step(PipelineStep.DUPLICATE_CHECK, StepResult(
                 step=PipelineStep.DUPLICATE_CHECK.value,
                 success=True,
-                message=f"Duplicate check complete - {dup_result.get('total_exact_duplicates', 0)} duplicates moved",
+                message=f"Duplicate check complete - {total_moved} files moved ({exact_dups} exact duplicates, {superseded} superseded)",
                 details=dup_result,
                 started_at=started,
                 completed_at=datetime.now().isoformat()
@@ -497,20 +578,72 @@ class FullPipelineOrchestrator:
 
             invalid_names = [r for r in name_results if not r.is_valid]
 
+            # Separate valid and invalid files
+            valid_names = [r for r in name_results if r.is_valid]
+            invalid_file_details = []
+            invalid_filenames = set()
+            report_key = None
+
             if invalid_names:
-                # Generate report content
-                report_lines = ["Name Validation Report", "=" * 50, ""]
-                report_lines.append(f"Total files: {name_validation.get('total_files', 0)}")
-                report_lines.append(f"Valid: {name_validation.get('valid_count', 0)}")
-                report_lines.append(f"Invalid: {name_validation.get('invalid_count', 0)}")
-                report_lines.append("")
-                report_lines.append("Invalid Files:")
-                for r in invalid_names:
-                    report_lines.append(f"  - {r.file_name}")
-                    if r.error_message:
-                        report_lines.append(f"      Error: {r.error_message}")
+                # Generate detailed report content for person who needs to fix files
+                report_lines = [
+                    "=" * 80,
+                    "FILE NAME VALIDATION REPORT",
+                    "=" * 80,
+                    "",
+                    "SUMMARY",
+                    "-" * 40,
+                    f"Total files checked: {name_validation.get('total_files', 0)}",
+                    f"Valid files: {name_validation.get('valid_count', 0)}",
+                    f"Invalid files: {name_validation.get('invalid_count', 0)}",
+                    f"Auto-correctable: {name_validation.get('correctable_count', 0)}",
+                    "",
+                    "NOTE: Pipeline will continue processing VALID files.",
+                    "Invalid files have been moved to the InvalidFiles folder.",
+                    "",
+                    "EXPECTED FILE NAME FORMAT",
+                    "-" * 40,
+                    "Pattern: HCM_{SOURCE}_INTF_{ENTITY}_{DATE}.csv",
+                    "",
+                    f"Valid SOURCES: {', '.join(name_validation.get('valid_sources', []))}",
+                    f"Valid ENTITIES: {', '.join(name_validation.get('valid_entities', []))}",
+                    "Valid DATE formats: YYYYMMDD, YYYYMMDDHHMM, YYYYMMDDHHMMSS",
+                    "",
+                    "=" * 80,
+                    "INVALID FILES - ACTION REQUIRED",
+                    "=" * 80,
+                    ""
+                ]
+
+                # Build detailed list of invalid files for report
+                for i, r in enumerate(invalid_names, 1):
+                    report_lines.append(f"[{i}] FILE: {r.file_name}")
+                    report_lines.append(f"    ERROR: {r.error_message or 'Unknown error'}")
+                    if r.source:
+                        report_lines.append(f"    Detected Source: {r.source}")
+                    if r.entity:
+                        report_lines.append(f"    Detected Entity: {r.entity}")
+                    if r.date_str:
+                        report_lines.append(f"    Detected Date: {r.date_str}")
                     if r.suggested_correction:
-                        report_lines.append(f"      Suggested: {r.suggested_correction}")
+                        report_lines.append(f"    SUGGESTED FIX: Rename to -> {r.suggested_correction}")
+                    report_lines.append("")
+
+                    # Build dict for JSON serialization
+                    invalid_file_details.append({
+                        'file_name': r.file_name,
+                        'error_message': r.error_message,
+                        'detected_source': r.source,
+                        'detected_entity': r.entity,
+                        'detected_date': r.date_str,
+                        'suggested_correction': r.suggested_correction,
+                        'similarity_score': r.similarity_score
+                    })
+                    invalid_filenames.add(r.file_name)
+
+                report_lines.append("=" * 80)
+                report_lines.append("END OF VALIDATION REPORT")
+                report_lines.append("=" * 80)
                 report_content = "\n".join(report_lines)
 
                 report_key = self._upload_report(
@@ -519,35 +652,85 @@ class FullPipelineOrchestrator:
                     report_content
                 )
 
+                # Move invalid files to a separate folder (don't stop the pipeline)
+                invalid_folder = f"{folder_name}/4_InvalidFiles/"
+                moved_invalid = 0
+                for f in files:
+                    if f['filename'] in invalid_filenames:
+                        try:
+                            # Move to invalid folder
+                            new_key = f"{invalid_folder}{f['filename']}"
+                            self.s3_client.copy_object(
+                                Bucket=self.bucket,
+                                CopySource={'Bucket': self.bucket, 'Key': f['s3_key']},
+                                Key=new_key
+                            )
+                            self.s3_client.delete_object(Bucket=self.bucket, Key=f['s3_key'])
+                            moved_invalid += 1
+                        except Exception as move_err:
+                            pass  # Continue even if move fails
+
+                # Filter out invalid files from the processing list
+                files = [f for f in files if f['filename'] not in invalid_filenames]
+
+            # Determine success status - partial success if some files are invalid but we have valid files
+            if invalid_names and valid_names:
+                # Partial success - some invalid, some valid
+                complete_step(PipelineStep.NAME_VALIDATION, StepResult(
+                    step=PipelineStep.NAME_VALIDATION.value,
+                    success=True,  # Mark as success so pipeline continues
+                    message=f"Name validation: {len(valid_names)} valid, {len(invalid_names)} invalid (moved aside, continuing with valid files)",
+                    details={
+                        'total_files': len(name_results),
+                        'valid_files': len(valid_names),
+                        'invalid_files': len(invalid_names),
+                        'correctable_files': name_validation.get('correctable_count', 0),
+                        'valid_sources': name_validation.get('valid_sources', []),
+                        'valid_entities': name_validation.get('valid_entities', []),
+                        'invalid_file_details': invalid_file_details,
+                        'invalid_files_moved': moved_invalid if invalid_names else 0,
+                        'continuing_with_valid': True
+                    },
+                    report_key=report_key,
+                    started_at=started,
+                    completed_at=datetime.now().isoformat()
+                ))
+            elif invalid_names and not valid_names:
+                # All files invalid - must stop
                 complete_step(PipelineStep.NAME_VALIDATION, StepResult(
                     step=PipelineStep.NAME_VALIDATION.value,
                     success=False,
-                    message=f"Name validation failed - {len(invalid_names)} invalid file names",
+                    message=f"Name validation failed - ALL {len(invalid_names)} files have invalid names",
                     details={
                         'total_files': len(name_results),
+                        'valid_files': 0,
                         'invalid_files': len(invalid_names),
-                        'invalid_names': [r.file_name for r in invalid_names]
+                        'correctable_files': name_validation.get('correctable_count', 0),
+                        'valid_sources': name_validation.get('valid_sources', []),
+                        'valid_entities': name_validation.get('valid_entities', []),
+                        'invalid_file_details': invalid_file_details
                     },
                     report_key=report_key,
                     started_at=started,
                     completed_at=datetime.now().isoformat()
                 ))
 
-                # Stop pipeline on validation error
+                # Stop pipeline only if ALL files are invalid
                 result.status = 'failed'
-                result.error = f"Name validation failed - {len(invalid_names)} invalid files"
-                result.report_url = self._generate_presigned_url(report_key)
+                result.error = f"Name validation failed - ALL files have invalid names"
+                result.report_url = self._generate_presigned_url(report_key) if report_key else None
                 result.completed_at = datetime.now().isoformat()
                 return result
-
-            complete_step(PipelineStep.NAME_VALIDATION, StepResult(
-                step=PipelineStep.NAME_VALIDATION.value,
-                success=True,
-                message=f"All {len(name_results)} file names are valid",
-                details={'total_files': len(name_results)},
-                started_at=started,
-                completed_at=datetime.now().isoformat()
-            ))
+            else:
+                # All files valid
+                complete_step(PipelineStep.NAME_VALIDATION, StepResult(
+                    step=PipelineStep.NAME_VALIDATION.value,
+                    success=True,
+                    message=f"All {len(name_results)} file names are valid",
+                    details={'total_files': len(name_results)},
+                    started_at=started,
+                    completed_at=datetime.now().isoformat()
+                ))
 
             # Step 6: Column Schema Validation
             update_progress(PipelineStep.SCHEMA_VALIDATION, "Validating column schemas...")
@@ -559,47 +742,92 @@ class FullPipelineOrchestrator:
                 bucket=self.bucket
             )
 
+            schema_report_key = None
             if schema_report.has_errors:
                 # Generate and upload report
                 report_content = generate_schema_validation_report(schema_report)
-                report_key = self._upload_report(
+                schema_report_key = self._upload_report(
                     folders['validation'],
                     f'schema_validation_{pipeline_id}.txt',
                     report_content
                 )
 
+                # Get list of invalid file names from schema report
+                invalid_schema_files = set()
+                if hasattr(schema_report, 'file_results'):
+                    for fr in schema_report.file_results:
+                        if hasattr(fr, 'is_valid') and not fr.is_valid:
+                            invalid_schema_files.add(fr.filename if hasattr(fr, 'filename') else '')
+
+                # Check if we have valid files to continue with
+                if schema_report.valid_files > 0:
+                    # Move invalid schema files aside, continue with valid ones
+                    invalid_folder = f"{folder_name}/5_InvalidSchema/"
+                    moved_invalid = 0
+                    for f in files:
+                        if f['filename'] in invalid_schema_files:
+                            try:
+                                new_key = f"{invalid_folder}{f['filename']}"
+                                self.s3_client.copy_object(
+                                    Bucket=self.bucket,
+                                    CopySource={'Bucket': self.bucket, 'Key': f['s3_key']},
+                                    Key=new_key
+                                )
+                                self.s3_client.delete_object(Bucket=self.bucket, Key=f['s3_key'])
+                                moved_invalid += 1
+                            except Exception:
+                                pass
+
+                    # Filter out invalid files
+                    files = [f for f in files if f['filename'] not in invalid_schema_files]
+
+                    complete_step(PipelineStep.SCHEMA_VALIDATION, StepResult(
+                        step=PipelineStep.SCHEMA_VALIDATION.value,
+                        success=True,  # Mark success to continue pipeline
+                        message=f"Schema validation: {schema_report.valid_files} valid, {schema_report.invalid_files} invalid (moved aside, continuing)",
+                        details={
+                            'total_files': schema_report.total_files,
+                            'valid_files': schema_report.valid_files,
+                            'invalid_files': schema_report.invalid_files,
+                            'continuing_with_valid': True
+                        },
+                        report_key=schema_report_key,
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+                else:
+                    # All files have schema errors - must stop
+                    complete_step(PipelineStep.SCHEMA_VALIDATION, StepResult(
+                        step=PipelineStep.SCHEMA_VALIDATION.value,
+                        success=False,
+                        message=f"Schema validation failed - ALL {schema_report.invalid_files} files have invalid columns",
+                        details={
+                            'total_files': schema_report.total_files,
+                            'valid_files': schema_report.valid_files,
+                            'invalid_files': schema_report.invalid_files
+                        },
+                        report_key=schema_report_key,
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+
+                    result.status = 'failed'
+                    result.error = f"Schema validation failed - ALL files have invalid columns"
+                    result.report_url = self._generate_presigned_url(schema_report_key)
+                    result.completed_at = datetime.now().isoformat()
+                    return result
+            else:
                 complete_step(PipelineStep.SCHEMA_VALIDATION, StepResult(
                     step=PipelineStep.SCHEMA_VALIDATION.value,
-                    success=False,
-                    message=f"Schema validation failed - {schema_report.invalid_files} files have invalid columns",
+                    success=True,
+                    message=f"All {schema_report.total_files} file schemas are valid",
                     details={
                         'total_files': schema_report.total_files,
-                        'valid_files': schema_report.valid_files,
-                        'invalid_files': schema_report.invalid_files
+                        'valid_files': schema_report.valid_files
                     },
-                    report_key=report_key,
                     started_at=started,
                     completed_at=datetime.now().isoformat()
                 ))
-
-                # Stop pipeline on validation error
-                result.status = 'failed'
-                result.error = f"Schema validation failed - {schema_report.invalid_files} files have invalid columns"
-                result.report_url = self._generate_presigned_url(report_key)
-                result.completed_at = datetime.now().isoformat()
-                return result
-
-            complete_step(PipelineStep.SCHEMA_VALIDATION, StepResult(
-                step=PipelineStep.SCHEMA_VALIDATION.value,
-                success=True,
-                message=f"All {schema_report.total_files} file schemas are valid",
-                details={
-                    'total_files': schema_report.total_files,
-                    'valid_files': schema_report.valid_files
-                },
-                started_at=started,
-                completed_at=datetime.now().isoformat()
-            ))
 
             # Step 7: Completeness Check
             # PARTIAL PROCESSING: Complete entities continue, incomplete entities are reported
@@ -707,7 +935,7 @@ class FullPipelineOrchestrator:
 
                 load_results = loader.load_files(
                     files=[{'filename': f['filename'], 's3_key': f['s3_key']} for f in files],
-                    drop_existing=False  # Use existing tables
+                    drop_existing=True  # Clear existing data before loading new data
                 )
 
                 # Generate load report
@@ -820,157 +1048,200 @@ class FullPipelineOrchestrator:
             update_progress(PipelineStep.EXPORT_FILES, "Exporting delta files...")
             started = datetime.now().isoformat()
 
-            try:
-                exporter = DeltaExporter(
-                    bucket=self.bucket,
-                    secret_name=self.secret_name,
-                    database_override=database_override,
-                    output_prefix=folders['export']
-                )
+            # If procedure was skipped, also skip export (both will be done locally)
+            if skip_procedure:
+                complete_step(PipelineStep.EXPORT_FILES, StepResult(
+                    step=PipelineStep.EXPORT_FILES.value,
+                    success=True,
+                    message="Export skipped - will run locally after stored procedure",
+                    details={'skipped': True, 'reason': 'skip_procedure=True', 'export_folder': folders['export']},
+                    started_at=started,
+                    completed_at=datetime.now().isoformat()
+                ))
+            else:
+                try:
+                    exporter = DeltaExporter(
+                        bucket=self.bucket,
+                        secret_name=self.secret_name,
+                        database_override=database_override,
+                        output_prefix=folders['export']
+                    )
 
-                export_result = exporter.export_all(update_status=True)
+                    export_result = exporter.export_all(update_status=True)
 
-                # Generate export report
-                export_report_content = self._generate_export_report(export_result)
-                report_key = self._upload_report(
-                    folders['export'],
-                    f'export_{pipeline_id}.txt',
-                    export_report_content
-                )
+                    # Generate export report
+                    export_report_content = self._generate_export_report(export_result)
+                    report_key = self._upload_report(
+                        folders['export'],
+                        f'export_{pipeline_id}.txt',
+                        export_report_content
+                    )
 
-                if not export_result.get('success'):
+                    if not export_result.get('success'):
+                        complete_step(PipelineStep.EXPORT_FILES, StepResult(
+                            step=PipelineStep.EXPORT_FILES.value,
+                            success=False,
+                            message=f"Export failed: {export_result.get('error', 'Unknown error')}",
+                            details=export_result,
+                            report_key=report_key,
+                            started_at=started,
+                            completed_at=datetime.now().isoformat()
+                        ))
+
+                        result.status = 'failed'
+                        result.error = f"Export failed: {export_result.get('error', 'Unknown error')}"
+                        result.report_url = self._generate_presigned_url(report_key)
+                        result.completed_at = datetime.now().isoformat()
+                        return result
+
                     complete_step(PipelineStep.EXPORT_FILES, StepResult(
                         step=PipelineStep.EXPORT_FILES.value,
-                        success=False,
-                        message=f"Export failed: {export_result.get('error', 'Unknown error')}",
+                        success=True,
+                        message=f"Exported {export_result.get('total_files', 0)} files with {export_result.get('total_rows', 0)} total rows",
                         details=export_result,
                         report_key=report_key,
                         started_at=started,
                         completed_at=datetime.now().isoformat()
                     ))
 
+                except Exception as export_error:
+                    complete_step(PipelineStep.EXPORT_FILES, StepResult(
+                        step=PipelineStep.EXPORT_FILES.value,
+                        success=False,
+                        message=f"Export failed: {str(export_error)}",
+                        details={'error': str(export_error)},
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+
                     result.status = 'failed'
-                    result.error = f"Export failed: {export_result.get('error', 'Unknown error')}"
-                    result.report_url = self._generate_presigned_url(report_key)
+                    result.error = f"Export failed: {str(export_error)}"
                     result.completed_at = datetime.now().isoformat()
                     return result
-
-                complete_step(PipelineStep.EXPORT_FILES, StepResult(
-                    step=PipelineStep.EXPORT_FILES.value,
-                    success=True,
-                    message=f"Exported {export_result.get('total_files', 0)} files with {export_result.get('total_rows', 0)} total rows",
-                    details=export_result,
-                    report_key=report_key,
-                    started_at=started,
-                    completed_at=datetime.now().isoformat()
-                ))
-
-            except Exception as export_error:
-                complete_step(PipelineStep.EXPORT_FILES, StepResult(
-                    step=PipelineStep.EXPORT_FILES.value,
-                    success=False,
-                    message=f"Export failed: {str(export_error)}",
-                    details={'error': str(export_error)},
-                    started_at=started,
-                    completed_at=datetime.now().isoformat()
-                ))
-
-                result.status = 'failed'
-                result.error = f"Export failed: {str(export_error)}"
-                result.completed_at = datetime.now().isoformat()
-                return result
 
             # Step 11: Upload to Sterling/SFTP
             update_progress(PipelineStep.UPLOAD_STERLING, "Uploading export files to SFTP...")
             started = datetime.now().isoformat()
 
-            try:
-                # Get SFTP credentials from environment or secret
-                sftp_host = os.environ.get('SFTP_UPLOAD_HOST', '10.3.3.146')
-                sftp_port = int(os.environ.get('SFTP_UPLOAD_PORT', 22))
-                sftp_user = os.environ.get('SFTP_UPLOAD_USER', 'gprerpusr')
-                sftp_password = os.environ.get('SFTP_UPLOAD_PASSWORD')
-                sftp_secret = os.environ.get('SFTP_UPLOAD_SECRET')
-                remote_folder = os.environ.get('SFTP_UPLOAD_FOLDER', '/GPR/HCM/INPUT')
+            # Check if SFTP upload should be skipped (to run locally with VPN)
+            if skip_sftp_upload:
+                # List export files so desktop app can do the upload locally
+                export_files = []
+                try:
+                    paginator = self.s3_client.get_paginator('list_objects_v2')
+                    for page in paginator.paginate(Bucket=self.bucket, Prefix=folders['export']):
+                        for obj in page.get('Contents', []):
+                            if obj['Key'].lower().endswith('.csv'):
+                                export_files.append({
+                                    's3_key': obj['Key'],
+                                    'filename': obj['Key'].split('/')[-1],
+                                    'size': obj['Size']
+                                })
+                except Exception as e:
+                    export_files = []
 
-                uploader = SftpUploader(
-                    bucket=self.bucket,
-                    sftp_secret_name=sftp_secret,
-                    sftp_host=sftp_host,
-                    sftp_port=sftp_port,
-                    sftp_user=sftp_user,
-                    sftp_password=sftp_password,
-                    remote_folder=remote_folder
-                )
+                complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
+                    step=PipelineStep.UPLOAD_STERLING.value,
+                    success=True,
+                    message=f"SFTP upload skipped - {len(export_files)} files ready for local upload",
+                    details={
+                        'skipped': True,
+                        'reason': 'Local VPN required',
+                        'export_folder': folders['export'],
+                        'export_files': export_files,
+                        'files_pending_upload': len(export_files)
+                    },
+                    started_at=started,
+                    completed_at=datetime.now().isoformat()
+                ))
+            else:
+                try:
+                    # Get SFTP credentials from environment or secret
+                    sftp_host = os.environ.get('SFTP_UPLOAD_HOST', '10.3.3.146')
+                    sftp_port = int(os.environ.get('SFTP_UPLOAD_PORT', 22))
+                    sftp_user = os.environ.get('SFTP_UPLOAD_USER', 'gprerpusr')
+                    sftp_password = os.environ.get('SFTP_UPLOAD_PASSWORD')
+                    sftp_secret = os.environ.get('SFTP_UPLOAD_SECRET')
+                    remote_folder = os.environ.get('SFTP_UPLOAD_FOLDER', '/GPR/HCM/INPUT')
 
-                # Upload all files from export folder
-                upload_result = uploader.upload_from_prefix(
-                    prefix=folders['export'],
-                    file_extension='.csv'
-                )
+                    uploader = SftpUploader(
+                        bucket=self.bucket,
+                        sftp_secret_name=sftp_secret,
+                        sftp_host=sftp_host,
+                        sftp_port=sftp_port,
+                        sftp_user=sftp_user,
+                        sftp_password=sftp_password,
+                        remote_folder=remote_folder
+                    )
 
-                # Generate upload report
-                upload_report_content = self._generate_upload_report(upload_result)
-                report_key = self._upload_report(
-                    folders['upload'],
-                    f'upload_{pipeline_id}.txt',
-                    upload_report_content
-                )
+                    # Upload all files from export folder
+                    upload_result = uploader.upload_from_prefix(
+                        prefix=folders['export'],
+                        file_extension='.csv'
+                    )
 
-                if not upload_result.get('success'):
+                    # Generate upload report
+                    upload_report_content = self._generate_upload_report(upload_result)
+                    report_key = self._upload_report(
+                        folders['upload'],
+                        f'upload_{pipeline_id}.txt',
+                        upload_report_content
+                    )
+
+                    if not upload_result.get('success'):
+                        complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
+                            step=PipelineStep.UPLOAD_STERLING.value,
+                            success=False,
+                            message=f"SFTP upload failed: {upload_result.get('error', 'Unknown error')}",
+                            details=upload_result,
+                            report_key=report_key,
+                            started_at=started,
+                            completed_at=datetime.now().isoformat()
+                        ))
+
+                        result.status = 'partial'  # Pipeline still partially successful
+                        result.error = f"SFTP upload failed: {upload_result.get('error', 'Unknown error')}"
+                        result.report_url = self._generate_presigned_url(report_key)
+                        result.completed_at = datetime.now().isoformat()
+                        return result
+
+                    # Move uploaded files to sent folder in S3
+                    if upload_result.get('file_results'):
+                        uploaded_keys = [
+                            fr['s3_key']
+                            for fr in upload_result['file_results']
+                            if fr.get('success')
+                        ]
+                        if uploaded_keys:
+                            sent_prefix = f"{folder_name}/7_Sent_Files/"
+                            move_result = uploader.move_uploaded_to_sent(uploaded_keys, sent_prefix)
+                            upload_result['move_result'] = move_result
+
                     complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
                         step=PipelineStep.UPLOAD_STERLING.value,
-                        success=False,
-                        message=f"SFTP upload failed: {upload_result.get('error', 'Unknown error')}",
+                        success=True,
+                        message=f"Uploaded {upload_result.get('files_uploaded', 0)} files to SFTP ({upload_result.get('total_bytes', 0):,} bytes)",
                         details=upload_result,
                         report_key=report_key,
                         started_at=started,
                         completed_at=datetime.now().isoformat()
                     ))
 
-                    result.status = 'partial'  # Pipeline still partially successful
-                    result.error = f"SFTP upload failed: {upload_result.get('error', 'Unknown error')}"
-                    result.report_url = self._generate_presigned_url(report_key)
+                except Exception as upload_error:
+                    complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
+                        step=PipelineStep.UPLOAD_STERLING.value,
+                        success=False,
+                        message=f"SFTP upload failed: {str(upload_error)}",
+                        details={'error': str(upload_error)},
+                        started_at=started,
+                        completed_at=datetime.now().isoformat()
+                    ))
+
+                    # Mark as partial success since data processing completed
+                    result.status = 'partial'
+                    result.error = f"SFTP upload failed: {str(upload_error)}"
                     result.completed_at = datetime.now().isoformat()
                     return result
-
-                # Move uploaded files to sent folder in S3
-                if upload_result.get('file_results'):
-                    uploaded_keys = [
-                        fr['s3_key']
-                        for fr in upload_result['file_results']
-                        if fr.get('success')
-                    ]
-                    if uploaded_keys:
-                        sent_prefix = f"{folder_name}/7_Sent_Files/"
-                        move_result = uploader.move_uploaded_to_sent(uploaded_keys, sent_prefix)
-                        upload_result['move_result'] = move_result
-
-                complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
-                    step=PipelineStep.UPLOAD_STERLING.value,
-                    success=True,
-                    message=f"Uploaded {upload_result.get('files_uploaded', 0)} files to SFTP ({upload_result.get('total_bytes', 0):,} bytes)",
-                    details=upload_result,
-                    report_key=report_key,
-                    started_at=started,
-                    completed_at=datetime.now().isoformat()
-                ))
-
-            except Exception as upload_error:
-                complete_step(PipelineStep.UPLOAD_STERLING, StepResult(
-                    step=PipelineStep.UPLOAD_STERLING.value,
-                    success=False,
-                    message=f"SFTP upload failed: {str(upload_error)}",
-                    details={'error': str(upload_error)},
-                    started_at=started,
-                    completed_at=datetime.now().isoformat()
-                ))
-
-                # Mark as partial success since data processing completed
-                result.status = 'partial'
-                result.error = f"SFTP upload failed: {str(upload_error)}"
-                result.completed_at = datetime.now().isoformat()
-                return result
 
             # Pipeline complete!
             result.status = 'success'
@@ -1013,7 +1284,7 @@ class FullPipelineOrchestrator:
 
     def _generate_load_report(self, load_results: Dict) -> str:
         """Generate a detailed text report for SQL load results."""
-        lines = ["=" * 80, "SQL SERVER LOAD REPORT", "=" * 80, ""]
+        lines = ["=" * 80, "SQL SERVER LOAD REPORT", f"Code Version: {CODE_VERSION}", "=" * 80, ""]
 
         lines.append(f"Loaded Tables: {load_results.get('loaded_tables', 0)}")
         lines.append(f"Failed Tables: {load_results.get('failed_tables', 0)}")
@@ -1320,6 +1591,213 @@ class FullPipelineOrchestrator:
         return "\n".join(lines)
 
 
+# Version identifier for deployment verification
+CODE_VERSION = "2.3.0-header-validation"
+
+
+def _run_diagnostics(body):
+    """
+    Run diagnostics to check column mappings, CSV structure, and DB columns.
+    """
+    import pymssql
+    from .sql_table_loader import (
+        COLUMN_MAPPINGS, EXPECTED_CSV_HEADERS, get_column_mapping, get_expected_headers,
+        validate_csv_headers, get_aws_secret, parse_connection_string,
+        extract_entity_from_filename, extract_source_from_filename, read_csv_data,
+        get_table_columns, SQL_TABLE_LOADER_VERSION
+    )
+
+    results = {
+        'code_version': CODE_VERSION,
+        'sql_table_loader_version': SQL_TABLE_LOADER_VERSION,
+        'diagnostics': {}
+    }
+
+    entity = body.get('entity', 'HCM_PERSON_ASSIGNMENT_INTF')
+    source = body.get('source', 'FIMAS')
+    environment = body.get('environment', 'intf')
+
+    # Check expected headers for this entity/source
+    expected_headers = get_expected_headers(entity, source)
+    results['diagnostics']['expected_headers_defined'] = expected_headers is not None
+    results['diagnostics']['expected_headers'] = expected_headers if expected_headers else "NO EXPECTED HEADERS DEFINED"
+
+    # 1. Check what mapping is defined
+    mapping_key = (entity, source)
+    mapping = get_column_mapping(entity, source)
+
+    results['diagnostics']['mapping_key'] = str(mapping_key)
+    results['diagnostics']['mapping_exists'] = mapping is not None
+    results['diagnostics']['mapping_content'] = mapping if mapping else "NO MAPPING FOUND"
+
+    # Check if ASSIGNMENT_STATUS_TYPE is in the mapping
+    if mapping:
+        results['diagnostics']['has_assignment_status_type_mapping'] = 'ASSIGNMENT_STATUS_TYPE' in mapping
+        if 'ASSIGNMENT_STATUS_TYPE' in mapping:
+            results['diagnostics']['assignment_status_type_maps_to'] = mapping['ASSIGNMENT_STATUS_TYPE']
+
+    # 2. List all available mappings for this entity
+    entity_mappings = [k for k in COLUMN_MAPPINGS.keys() if k[0] == entity]
+    results['diagnostics']['available_mappings_for_entity'] = [str(k) for k in entity_mappings]
+
+    # 3. Try to connect to database and get table columns
+    try:
+        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
+        connection_string = get_aws_secret(secret_name)
+        conn_params = parse_connection_string(connection_string)
+
+        # Override database based on environment
+        if environment == 'production':
+            conn_params['database'] = 'Hacienda_ERP'
+        elif environment == 'intf':
+            conn_params['database'] = 'Hacienda_ERP_INTF'
+
+        results['diagnostics']['database'] = conn_params['database']
+        results['diagnostics']['server'] = conn_params['server']
+
+        table_name = f"{entity}_{source}"
+
+        with pymssql.connect(
+            server=conn_params['server'],
+            port=conn_params.get('port', 1433),
+            user=conn_params['user'],
+            password=conn_params['password'],
+            database=conn_params['database'],
+            tds_version='7.3'
+        ) as conn:
+            cursor = conn.cursor()
+
+            # Get table columns
+            db_columns = get_table_columns(cursor, table_name)
+            results['diagnostics']['db_table'] = table_name
+            results['diagnostics']['db_columns'] = db_columns
+            results['diagnostics']['db_has_assignment_status_type'] = 'ASSIGNMENT_STATUS_TYPE' in [c.upper() for c in db_columns]
+
+            # Also check if table exists and what schemas have it
+            cursor.execute(f"""
+                SELECT TABLE_SCHEMA, TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_NAME LIKE '%{table_name}%'
+            """)
+            results['diagnostics']['matching_tables'] = [{'schema': r[0], 'table': r[1]} for r in cursor.fetchall()]
+
+            # Check all schemas for this table
+            cursor.execute(f"""
+                SELECT TABLE_SCHEMA, COLUMN_NAME
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = '{table_name}'
+                ORDER BY ORDINAL_POSITION
+            """)
+            results['diagnostics']['columns_all_schemas'] = [{'schema': r[0], 'column': r[1]} for r in cursor.fetchall()]
+
+            # List ALL tables in the database (first 50)
+            cursor.execute("""
+                SELECT TOP 50 TABLE_SCHEMA, TABLE_NAME
+                FROM INFORMATION_SCHEMA.TABLES
+                WHERE TABLE_TYPE = 'BASE TABLE'
+                ORDER BY TABLE_NAME
+            """)
+            results['diagnostics']['all_tables_sample'] = [{'schema': r[0], 'table': r[1]} for r in cursor.fetchall()]
+
+    except Exception as db_error:
+        results['diagnostics']['db_error'] = str(db_error)
+
+    # 4. Try to read CSV headers from S3
+    try:
+        bucket = os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
+        s3_client = boto3.client('s3')
+
+        # Find a matching file
+        prefix = 'downloads/'
+        response = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+
+        matching_files = []
+        for obj in response.get('Contents', []):
+            key = obj['Key']
+            filename = key.split('/')[-1]
+            if entity in filename.upper() and source in filename.upper():
+                matching_files.append(key)
+
+        results['diagnostics']['matching_s3_files'] = matching_files[:5]  # First 5
+
+        if matching_files:
+            # Read first matching file's headers
+            s3_key = matching_files[0]
+            headers, rows = read_csv_data(s3_client, bucket, s3_key)
+            results['diagnostics']['csv_file'] = s3_key
+            results['diagnostics']['csv_headers'] = headers
+            results['diagnostics']['csv_row_count'] = len(rows)
+            results['diagnostics']['csv_has_assignment_status_type'] = 'ASSIGNMENT_STATUS_TYPE' in [h.upper() for h in headers]
+
+            # Validate CSV headers against expected
+            header_validation = validate_csv_headers(headers, entity, source, strict=False)
+            results['diagnostics']['header_validation'] = {
+                'valid': header_validation['valid'],
+                'missing_headers': header_validation.get('missing_headers', []),
+                'extra_headers': header_validation.get('extra_headers', []),
+                'error': header_validation.get('error')
+            }
+
+            # 5. Simulate mapping process
+            if mapping and db_columns:
+                db_cols_upper = {c.upper(): c for c in db_columns}
+                col_indices = []
+                skipped_cols = []
+                duplicate_check = {}
+
+                for i, csv_col in enumerate(headers):
+                    csv_col_clean = csv_col.strip()
+
+                    # Check if this CSV column has a mapping defined
+                    if csv_col_clean in mapping:
+                        db_col = mapping[csv_col_clean]
+                        if db_col.upper() in db_cols_upper:
+                            actual_db_col = db_cols_upper[db_col.upper()]
+                            if actual_db_col in duplicate_check:
+                                results['diagnostics']['DUPLICATE_FOUND'] = {
+                                    'db_column': actual_db_col,
+                                    'first_csv_col': duplicate_check[actual_db_col],
+                                    'second_csv_col': csv_col_clean,
+                                    'mapping_type': 'mapped'
+                                }
+                            else:
+                                duplicate_check[actual_db_col] = csv_col_clean
+                                col_indices.append({'csv': csv_col_clean, 'db': actual_db_col, 'type': 'mapped'})
+                        else:
+                            skipped_cols.append(f"{csv_col_clean} (mapped to {db_col} but not in DB)")
+                    elif csv_col_clean.upper() in db_cols_upper:
+                        # Direct match
+                        actual_db_col = db_cols_upper[csv_col_clean.upper()]
+                        if actual_db_col in duplicate_check:
+                            results['diagnostics']['DUPLICATE_FOUND'] = {
+                                'db_column': actual_db_col,
+                                'first_csv_col': duplicate_check[actual_db_col],
+                                'second_csv_col': csv_col_clean,
+                                'mapping_type': 'direct'
+                            }
+                        else:
+                            duplicate_check[actual_db_col] = csv_col_clean
+                            col_indices.append({'csv': csv_col_clean, 'db': actual_db_col, 'type': 'direct'})
+                    else:
+                        skipped_cols.append(csv_col_clean)
+
+                results['diagnostics']['simulated_mapping'] = col_indices
+                results['diagnostics']['simulated_skipped'] = skipped_cols
+                results['diagnostics']['columns_to_insert'] = len(col_indices)
+
+    except Exception as s3_error:
+        results['diagnostics']['s3_error'] = str(s3_error)
+
+    return {
+        'statusCode': 200,
+        'headers': {
+            'Content-Type': 'application/json',
+            'Access-Control-Allow-Origin': '*'
+        },
+        'body': json.dumps(results, default=str, indent=2)
+    }
+
+
 def run_full_pipeline_handler(event, context):
     """
     Lambda handler for running the full pipeline.
@@ -1330,21 +1808,39 @@ def run_full_pipeline_handler(event, context):
         "test_mode": true/false,
         "source_prefix": "downloads/" (optional),
         "skip_sftp": true/false (optional, default true),
-        "skip_procedure": true/false (optional, default false - run locally from desktop)
+        "skip_procedure": true/false (optional, default false - run locally from desktop),
+        "skip_sftp_upload": true/false (optional, default true - SFTP upload requires local VPN)
     }
+
+    Special diagnostic actions:
+    - "action": "diagnose" - Run diagnostics on column mappings and CSV/DB structure
     """
     try:
         # Parse request
         if event.get('body'):
             body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
         else:
-            body = {}
+            body = event  # Allow direct JSON in event for CLI testing
+
+        # Handle diagnostic action
+        if body.get('action') == 'diagnose':
+            return _run_diagnostics(body)
 
         environment = body.get('environment', 'test')
         test_mode = body.get('test_mode', True)
         source_prefix = body.get('source_prefix', 'downloads/')
         skip_sftp = body.get('skip_sftp', True)  # Default to skip SFTP download
         skip_procedure = body.get('skip_procedure', False)  # Default to run procedure
+        skip_sftp_upload = body.get('skip_sftp_upload', True)  # Default to skip - requires local VPN
+
+        # SFTP download credentials (passed from desktop app)
+        sftp_download_config = {
+            'host': body.get('sftp_download_host', os.environ.get('SFTP_DOWNLOAD_HOST', '10.3.3.146')),
+            'port': int(body.get('sftp_download_port', os.environ.get('SFTP_DOWNLOAD_PORT', 22))),
+            'user': body.get('sftp_download_user', os.environ.get('SFTP_DOWNLOAD_USER', 'gprerpusr')),
+            'password': body.get('sftp_download_password', os.environ.get('SFTP_DOWNLOAD_PASSWORD')),
+            'folder': body.get('sftp_download_folder', os.environ.get('SFTP_DOWNLOAD_FOLDER', '/OCI/HCM/OUTPUT/'))
+        }
 
         # Get bucket from environment variable
         bucket = os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
@@ -1378,7 +1874,9 @@ def run_full_pipeline_handler(event, context):
             test_mode=test_mode,
             source_prefix=source_prefix,
             skip_download=skip_sftp,
-            skip_procedure=skip_procedure
+            skip_procedure=skip_procedure,
+            skip_sftp_upload=skip_sftp_upload,
+            sftp_download_config=sftp_download_config
         )
 
         return {

@@ -1,12 +1,26 @@
 """
 SQL Table Loader Module for Hacienda SFTP Downloads
+Version: 2.5.0 - Added deduplication for HCM_PERSON_INTF tables by PERSON_NUMBER
 
 This module loads CSV files into SQL Server tables with proper column mapping.
 Different source systems (RHUM, FIMAS, HACIENDA, KRONOSPOL, DOE, etc.) have
 different CSV column names that must be mapped to the standard database column names.
 
 Based on the original LoadIntfData.py implementation.
+
+Header validation ensures CSV files have the expected columns for each entity/source
+combination before attempting to load data.
+
+Change log:
+- 2.5.0: Added deduplication for HCM_PERSON_INTF tables by PERSON_NUMBER column to prevent
+         PRIMARY KEY violations in stored procedure when source CSV has duplicate person records.
+         Also added deduplication for HCM_PERSON_NID_INTF tables by PERSON_NUMBER.
+- 2.4.0: Added dual-mapping support via __ALSO__ syntax. Fixed HACIENDA Person Assignment
+         to map EMPL_CLASS to both ASSIGNMENT_CATEGORY and WORKER_CATEGORY per LoadIntfData.py
+- 2.3.0: Added CSV header validation per reference LoadIntfData.py
 """
+
+SQL_TABLE_LOADER_VERSION = "2.5.0"
 
 import boto3
 import io
@@ -34,6 +48,229 @@ SOURCE_ALIASES = {
 
 # PeopleSoft-style sources that need column name transformation
 PEOPLESOFT_SOURCES = ['RHUM', 'FIMAS', 'HACIENDA']
+
+
+# =============================================================================
+# EXPECTED CSV HEADERS BY ENTITY AND SOURCE
+# =============================================================================
+# These define the REQUIRED CSV columns for each entity/source combination.
+# Based on LoadIntfData.py reference implementation.
+# Format: (entity_type, source) -> [list of required CSV column names]
+
+EXPECTED_CSV_HEADERS = {
+    # =========================================================================
+    # HCM_PERSON_INTF - Person/Worker base file
+    # =========================================================================
+    ('HCM_PERSON_INTF', 'RHUM'): ['COUNTRY', 'EMPLID', 'EFFDT', 'START_DATE', 'BIRTHDATE'],
+    ('HCM_PERSON_INTF', 'FIMAS'): ['COUNTRY', 'EMPLID', 'EFFDT', 'START_DATE', 'BIRTHDATE'],
+    ('HCM_PERSON_INTF', 'HACIENDA'): ['COUNTRY', 'EMPLID', 'EFFDT', 'START_DATE', 'BIRTHDATE'],
+    ('HCM_PERSON_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EFFECTIVE_START_DATE',
+        'START_DATE', 'DATE_OF_BIRTH', 'EFFECTIVE_END_DATE', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EFFECTIVE_START_DATE',
+        'START_DATE', 'DATE_OF_BIRTH', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_INTF', 'ADPPOLICIA'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EFFECTIVE_START_DATE',
+        'EFFECTIVE_END_DATE', 'START_DATE', 'DATE_OF_BIRTH', 'SOURCE_SYSTEM_OWNER'
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_ADDRESS_INTF - Address file
+    # =========================================================================
+    ('HCM_PERSON_ADDRESS_INTF', 'RHUM'): [
+        'COUNTRY', 'EMPLID', 'ADDRESS_TYPE', 'EFFDT', 'ADDRESS1', 'ADDRESS2', 'ADDRESS3', 'ADDRESS4',
+        'COUNTY', 'STATE', 'REG_REGION', 'CITY', 'POSTAL', 'EFF_STATUS', 'PER_TYPE', 'EMPL_STATUS'
+    ],
+    ('HCM_PERSON_ADDRESS_INTF', 'FIMAS'): [
+        'COUNTRY', 'EMPLID', 'ADDRESS_TYPE', 'EFFDT', 'ADDRESS1', 'ADDRESS2', 'ADDRESS3', 'ADDRESS4',
+        'COUNTY', 'STATE', 'REG_REGION', 'CITY', 'POSTAL', 'EFF_STATUS', 'PER_TYPE', 'EMPL_STATUS'
+    ],
+    ('HCM_PERSON_ADDRESS_INTF', 'HACIENDA'): [
+        'COUNTRY', 'EMPLID', 'ADDRESS_TYPE', 'EFFDT', 'ADDRESS1', 'ADDRESS2', 'ADDRESS3', 'ADDRESS4',
+        'COUNTY', 'STATE', 'REG_REGION', 'CITY', 'POSTAL', 'EFF_STATUS', 'PER_TYPE', 'EMPL_STATUS'
+    ],
+    ('HCM_PERSON_ADDRESS_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ADDRESS_TYPE', 'EFFECTIVE_START_DATE',
+        'EFFECTIVE_END_DATE', 'COUNTRY', 'ADDRESS_LINE_1', 'ADDRESS_LINE_2', 'ADDRESS_LINE_3',
+        'ADDRESS_LINE_4', 'REGION_1', 'REGION_2', 'REGION_3', 'TOWN_OR_CITY', 'POSTAL_CODE',
+        'LONG_POSTAL_CODE', 'PRIMARY_FLAG', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_ADDRESS_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ADDRESS_TYPE', 'EFFECTIVE_START_DATE',
+        'COUNTRY', 'ADDRESS_LINE_1', 'ADDRESS_LINE_2', 'REGION_1', 'REGION_2', 'TOWN_OR_CITY',
+        'POSTAL_CODE', 'PRIMARY_FLAG', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_ADDRESS_INTF', 'ADPPOLICIA'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ADDRESS_TYPE', 'EFFECTIVE_START_DATE',
+        'EFFECTIVE_END_DATE', 'COUNTRY', 'ADDRESS_LINE_1', 'ADDRESS_LINE_2', 'REGION_2',
+        'TOWN_OR_CITY', 'POSTAL_CODE', 'SOURCE_SYSTEM_OWNER'
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_ASSIGNMENT_INTF - Assignment file (CRITICAL - has EMPL_STATUS)
+    # =========================================================================
+    ('HCM_PERSON_ASSIGNMENT_INTF', 'RHUM'): [
+        'COUNTRY', 'EMPLID', 'GEO_CODE', 'HIRE_DT', 'REHIRE_RECOMMENDATION', 'TERMINATION_DT',
+        'PIN_NUM', 'PER_TYPE', 'PER_STATUS', 'ACTION', 'ACTION_REASON', 'EFFDT', 'EFFSEQ',
+        'EMPL_STATUS', 'LAST_DATE_WORKED', 'BUSINESS_UNIT', 'ORIG_HIRE_DT', 'POSITION_NBR',
+        'POSITION_OVERRIDE', 'JOBCODE', 'SAL_ADMIN_PLAN', 'GRADE', 'STEP', 'DEPTID',
+        'JOB_REPORTING', 'LOCATION', 'PAYGROUP', 'COMPANY', 'REG_TEMP', 'FULL_PART_TIME',
+        'REHIRE_DT', 'HOURLY_RT', 'STD_HOURS', 'COMP_FREQUENCY', 'LANG_CD', 'EMPL_TYPE',
+        'FTE', 'EMPL_CLASS', 'ACTION_DT'
+    ],
+    ('HCM_PERSON_ASSIGNMENT_INTF', 'FIMAS'): [
+        'COUNTRY', 'EMPLID', 'GEO_CODE', 'HIRE_DT', 'REHIRE_RECOMMENDATION', 'TERMINATION_DT',
+        'PIN_NUM', 'PER_TYPE', 'PER_STATUS', 'ACTION', 'ACTION_REASON', 'EFFDT', 'EFFSEQ',
+        'EMPL_STATUS', 'LAST_DATE_WORKED', 'BUSINESS_UNIT', 'ORIG_HIRE_DT', 'POSITION_NBR',
+        'POSITION_OVERRIDE', 'JOBCODE', 'SAL_ADMIN_PLAN', 'GRADE', 'STEP', 'DEPTID',
+        'JOB_REPORTING', 'LOCATION', 'PAYGROUP', 'COMPANY', 'REG_TEMP', 'FULL_PART_TIME',
+        'REHIRE_DT', 'HOURLY_RT', 'STD_HOURS', 'COMP_FREQUENCY', 'LANG_CD', 'EMPL_TYPE',
+        'FTE', 'EMPL_CLASS', 'ACTION_DT', 'WORKER_CATEGORY'
+    ],
+    ('HCM_PERSON_ASSIGNMENT_INTF', 'HACIENDA'): [
+        'COUNTRY', 'EMPLID', 'GEO_CODE', 'HIRE_DT', 'REHIRE_RECOMMENDATION', 'TERMINATION_DT',
+        'PIN_NUM', 'PER_TYPE', 'PER_STATUS', 'ACTION', 'ACTION_REASON', 'EFFDT', 'EFFSEQ',
+        'EMPL_STATUS', 'LAST_DATE_WORKED', 'BUSINESS_UNIT', 'ORIG_HIRE_DT', 'POSITION_NBR',
+        'POSITION_OVERRIDE', 'JOBCODE', 'SAL_ADMIN_PLAN', 'GRADE', 'STEP', 'DEPTID',
+        'JOB_REPORTING', 'LOCATION', 'PAYGROUP', 'COMPANY', 'REG_TEMP', 'FULL_PART_TIME',
+        'REHIRE_DT', 'HOURLY_RT', 'STD_HOURS', 'COMP_FREQUENCY', 'LANG_CD', 'EMPL_TYPE',
+        'FTE', 'EMPL_CLASS', 'ACTION_DT'
+    ],
+    ('HCM_PERSON_ASSIGNMENT_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'HIRE_DATE', 'REHIRE_RECOMMENDATION',
+        'TERMINATION_DATE', 'ACTION_CODE', 'ACTION_REASON', 'EFFECTIVE_DATE', 'EFFECTIVE_SEQUENCE',
+        'ASSIGNMENT_STATUS_TYPE', 'LAST_WORKING_DATE', 'BUSINESS_UNIT', 'POSITION_CODE',
+        'POSITION_OVERRIDE', 'JOB_CODE', 'GRADE_CODE', 'DEPARTMENT_NAME', 'LOCATION_CODE',
+        'REGULAR_TEMPORARY', 'FULL_PART_TIME', 'FREQUENCY', 'ASSIGNMENT_CATEGORY', 'FTE',
+        'HOURLY_SALARIED_CODE', 'WORKING_HOURS'
+    ],
+    ('HCM_PERSON_ASSIGNMENT_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'LEGAL_ENTITY', 'HIRE_DATE',
+        'REHIRE_RECOMMENDATION_FLAG', 'PROJECTED_TERMINATION_DATE', 'ASSIGNMENT_NUMBER',
+        'SYSTEM_PERSON_TYPE', 'USER_PERSON_TYPE', 'PRIMARY_WORK_RELATION', 'PRIMARY_ASSIGNMENT',
+        'ACTION_CODE', 'EFFECTIVE_DATE', 'EFFECTIVE_SEQUENCE', 'ASSIGNMENT_STATUS_TYPE',
+        'ACTUAL_TERMINATION_DATE', 'LAST_WORKING_DATE', 'BUSINESS_UNIT', 'POSITION_CODE',
+        'JOB_CODE', 'GRADE_CODE', 'DEPARTMENT_NAME', 'LOCATION_CODE', 'WORKER_CATEGORY',
+        'ASSIGNMENT_CATEGORY', 'PERMANENT_TEMPORARY', 'FULL_PART_TIME', 'HOURLY_SALARIED_CODE',
+        'NORMAL_HOURS', 'FREQUENCY', 'FTE', 'UNION_NAME', 'CONTRACT_NUMBER', 'ATTRIBUTE_CATEGORY',
+        'ATTRIBUTE1'
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_NAME_INTF - Name file
+    # =========================================================================
+    ('HCM_PERSON_NAME_INTF', 'RHUM'): ['COUNTRY', 'EMPLID', 'EFFDT', 'FIRST_NAME', 'LAST_NAME'],
+    ('HCM_PERSON_NAME_INTF', 'FIMAS'): ['COUNTRY', 'EMPLID', 'EFFDT', 'FIRST_NAME', 'LAST_NAME'],
+    ('HCM_PERSON_NAME_INTF', 'HACIENDA'): ['COUNTRY', 'EMPLID', 'EFFDT', 'FIRST_NAME', 'LAST_NAME'],
+    ('HCM_PERSON_NAME_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'NAME_TYPE', 'EFFECTIVE_START_DATE',
+        'EFFECTIVE_END_DATE', 'LAST_NAME', 'FIRST_NAME', 'MIDDLE_NAMES', 'TITLE', 'PRE_NAME_ADJUNCT',
+        'SUFFIX', 'KNOWN_AS', 'PREVIOUS_LAST_NAME', 'HONORS', 'MILITARY_RANK', 'CHAR_SET_CONTEXT',
+        'ACADEMIC_TITLE', 'BIRTHNAME_PREFIX', 'BIRTHNAME', 'BIRTHNAME_SUFFIX', 'STD_MANNER_OF_ADDRESS',
+        'EXTEND_MANNER_ADDRESS', 'REPORT_FIRST_NAME', 'REPORT_LAST_NAME', 'MAIDEN_NAME',
+        'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_NAME_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'NAME_TYPE', 'EFFECTIVE_START_DATE',
+        'LAST_NAME', 'FIRST_NAME', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_NAME_INTF', 'ADPPOLICIA'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'NAME_TYPE', 'EFFECTIVE_START_DATE',
+        'EFFECTIVE_END_DATE', 'LAST_NAME', 'FIRST_NAME', 'MIDDLE_NAME', 'SUFFIX',
+        'PREVIOUS_LAST_NAME', 'SOURCE_SYSTEM_OWNER'
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_NID_INTF - National ID file
+    # =========================================================================
+    ('HCM_PERSON_NID_INTF', 'RHUM'): [
+        'COUNTRY', 'EMPLID', 'NATIONAL_ID_TYPE', 'NATIONAL_ID', 'NID_COUNTRY',
+        'US_WORK_ELIGIBILTY', 'PAYGROUP'
+    ],
+    ('HCM_PERSON_NID_INTF', 'FIMAS'): [
+        'COUNTRY', 'EMPLID', 'NATIONAL_ID_TYPE', 'NATIONAL_ID', 'NID_COUNTRY',
+        'US_WORK_ELIGIBILTY', 'PAYGROUP'
+    ],
+    ('HCM_PERSON_NID_INTF', 'HACIENDA'): [
+        'COUNTRY', 'EMPLID', 'NATIONAL_ID_TYPE', 'NATIONAL_ID', 'NID_COUNTRY',
+        'US_WORK_ELIGIBILTY', 'PAYGROUP'
+    ],
+    ('HCM_PERSON_NID_INTF', 'KRONOSPOL'): ['Country Code', 'Person Number', 'Identifier Number'],
+    ('HCM_PERSON_NID_INTF', 'KRONOSDE'): ['Country Code', 'Person Number', 'Identifier Number'],
+    ('HCM_PERSON_NID_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'LEGISLATION_CODE',
+        'NATIONAL_IDENTIFIER_TYPE', 'NATIONAL_IDENTIFIER_NUMBER', 'PRIMARY_FLAG'
+    ],
+    ('HCM_PERSON_NID_INTF', 'ADPPOLICIA'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'LEGISLATION_CODE',
+        'NATIONAL_IDENTIFIER_TYPE', 'NATIONAL_IDENTIFIER_NUMBER', 'PRIMARY_FLAG', 'SOURCE_SYSTEM_OWNER'
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_SUPERVISOR_INTF - Supervisor file
+    # =========================================================================
+    ('HCM_PERSON_SUPERVISOR_INTF', 'RHUM'): [
+        'COUNTRY', 'PERSON_NUMBER', 'MANAGER_TYPE', 'ACTION', 'ACTION_REASON', 'MANAGER_PERSON_NUMBER'
+    ],
+    ('HCM_PERSON_SUPERVISOR_INTF', 'FIMAS'): [
+        'COUNTRY', 'EMPLID', 'EFFDT', 'EMPLID2', 'ACTION', 'ACTION_REASON', 'DESCR',
+        'REPORTS_TO', 'TAX_LOCATION_CD', 'PAYGROUP', 'COMPANY'
+    ],
+    ('HCM_PERSON_SUPERVISOR_INTF', 'HACIENDA'): [
+        'COUNTRY', 'EMPLID', 'EFFDT', 'EMPLID2', 'ACTION', 'ACTION_REASON', 'DESCR',
+        'REPORTS_TO', 'TAX_LOCATION_CD', 'PAYGROUP', 'COMPANY'
+    ],
+    ('HCM_PERSON_SUPERVISOR_INTF', '911'): ['PERSON_NUMBER', 'SupervisorPersonNumber'],
+    ('HCM_PERSON_SUPERVISOR_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ASSIGNMENT_NUMBER', 'LEGAL_ENTITY',
+        'MANAGER_TYPE', 'EFFECTIVE_START_DATE', 'EFFECTIVE_END_DATE', 'ACTION_CODE', 'ACTION_REASON',
+        'MANAGER_PERSON_NUMBER', 'MANAGER_ASSIGNMENT_NUMBER', 'MANAGER_LEGAL_ENTITY', 'PRIMARY_FLAG',
+        'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_SUPERVISOR_INTF', 'KRONOSDE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ASSIGNMENT_NUMBER', 'LEGAL_ENTITY',
+        'MANAGER_TYPE', 'EFFECTIVE_START_DATE', 'EFFECTIVE_END_DATE', 'ACTION_CODE', 'ACTION_REASON',
+        'MANAGER_PERSON_NUMBER', 'MANAGER_ASSIGNMENT_NUMBER', 'MANAGER_LEGAL_ENTITY', 'PRIMARY_FLAG',
+        'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+        # Plus many ATTRIBUTE2-30, ATTRIBUTE_NUMBER1-20, ATTRIBUTE_DATE1-15 (omitted for brevity)
+    ],
+    ('HCM_PERSON_SUPERVISOR_INTF', 'SEPI'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'ASSIGNMENT_NUMBER', 'LEGAL_ENTITY',
+        'MANAGER_TYPE', 'EFFECTIVE_START_DATE', 'EFFECTIVE_END_DATE', 'ACTION_CODE', 'ACTION_REASON',
+        'MANAGER_PERSON_NUMBER', 'MANAGER_ASSIGNMENT_NUMBER', 'MANAGER_LEGAL_ENTITY', 'PRIMARY_FLAG',
+        'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+        # Plus many ATTRIBUTE2-30, ATTRIBUTE_NUMBER1-20, ATTRIBUTE_DATE1-15 (omitted for brevity)
+    ],
+
+    # =========================================================================
+    # HCM_PERSON_EMAIL_INTF - Email file
+    # =========================================================================
+    ('HCM_PERSON_EMAIL_INTF', 'RHUM'): ['COUNTRY', 'EMPLID', 'E_ADDR_TYPE', 'Email_ADDR', 'EFFDT'],
+    ('HCM_PERSON_EMAIL_INTF', 'FIMAS'): ['COUNTRY', 'EMPLID', 'E_ADDR_TYPE', 'EmailADDR', 'EFFDT'],
+    ('HCM_PERSON_EMAIL_INTF', 'HACIENDA'): ['COUNTRY', 'EMPLID', 'E_ADDR_TYPE', 'EmailADDR', 'EFFDT'],
+    ('HCM_PERSON_EMAIL_INTF', 'KRONOSPOL'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EMAIL_TYPE',
+        'EFFECTIVE_START_DATE', 'EMAIL_ADDRESS', 'PRIMARY_FLAG', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_EMAIL_INTF', 'DOE'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EMAIL_TYPE', 'DATE_FROM',
+        'EMAIL_ADDRESS', 'PRIMARY_FLAG', 'ATTRIBUTE_CATEGORY', 'ATTRIBUTE1'
+    ],
+    ('HCM_PERSON_EMAIL_INTF', 'ADPPOLICIA'): [
+        'COUNTRY_CODE', 'SWIFT_PERSON_TYPE', 'PERSON_NUMBER', 'EMAIL_TYPE', 'DATE_FROM',
+        'DATE_TO', 'EMAIL_ADDRESS', 'PRIMARY_FLAG', 'SOURCE_SYSTEM_OWNER'
+    ],
+
+    # =========================================================================
+    # HCM_SENIORITY_INTF - Seniority file
+    # =========================================================================
+    ('HCM_SENIORITY_INTF', 'RHUM'): ['PERSON_NUMBER', 'SENIORITY_DATE_CODE', 'ENTRY_DATE'],
+    ('HCM_SENIORITY_INTF', 'FIMAS'): ['PERSON_NUMBER', 'SENIORITY_DATE_CODE', 'ENTRY_DATE'],
+    ('HCM_SENIORITY_INTF', 'HACIENDA'): ['PERSON_NUMBER', 'SENIORITY_DATE_CODE', 'ENTRY_DATE'],
+}
 
 
 # =============================================================================
@@ -254,8 +491,7 @@ COLUMN_MAPPINGS = {
         'HIRE_DT': 'HIRE_DATE',
         'EFFDT': 'EFFECTIVE_DATE',
         'EFFSEQ': 'EFFECTIVE_SEQUENCE',
-        # Note: CSV has ASSIGNMENT_STATUS_TYPE directly, don't map EMPL_STATUS
-        'ASSIGNMENT_STATUS_TYPE': 'ASSIGNMENT_STATUS_TYPE',
+        'EMPL_STATUS': 'ASSIGNMENT_STATUS_TYPE',  # Reference uses EMPL_STATUS, not ASSIGNMENT_STATUS_TYPE column
         'BUSINESS_UNIT': 'BUSINESS_UNIT',
         'LOCATION': 'LOCATION_CODE',
         'ACTION': 'ACTION_CODE',
@@ -291,8 +527,7 @@ COLUMN_MAPPINGS = {
         'REHIRE_RECOMMENDATION': 'REHIRE_RECOMMENDATION',
         'EFFDT': 'EFFECTIVE_DATE',
         'EFFSEQ': 'EFFECTIVE_SEQUENCE',
-        # Note: CSV has ASSIGNMENT_STATUS_TYPE directly, don't map EMPL_STATUS
-        'ASSIGNMENT_STATUS_TYPE': 'ASSIGNMENT_STATUS_TYPE',
+        'EMPL_STATUS': 'ASSIGNMENT_STATUS_TYPE',  # Reference uses EMPL_STATUS, not ASSIGNMENT_STATUS_TYPE column
         'BUSINESS_UNIT': 'BUSINESS_UNIT',
         'LOCATION': 'LOCATION_CODE',
         'ACTION': 'ACTION_CODE',
@@ -318,6 +553,9 @@ COLUMN_MAPPINGS = {
         'GRADE': 'GRADE',
         'EMPL_CLASS': 'ASSIGNMENT_CATEGORY',
         'ACTION_DT': 'ACTION_DT',
+        # Note: EMPL_CLASS also maps to WORKER_CATEGORY per LoadIntfData.py line 489
+        # Use special dual-mapping syntax: source column ends with __ALSO__target
+        'EMPL_CLASS__ALSO__WORKER_CATEGORY': 'WORKER_CATEGORY',
     },
     ('HCM_PERSON_ASSIGNMENT_INTF', 'KRONOSPOL'): {
         # Direct mapping for Oracle HCM style columns
@@ -801,6 +1039,180 @@ def get_column_mapping(entity: str, source: str) -> Optional[Dict[str, str]]:
     return COLUMN_MAPPINGS.get(key)
 
 
+def get_expected_headers(entity: str, source: str) -> Optional[List[str]]:
+    """
+    Get the expected CSV headers for a specific entity and source combination.
+
+    Args:
+        entity: Entity type (e.g., 'HCM_PERSON_INTF')
+        source: Source system (e.g., 'FIMAS')
+
+    Returns:
+        List of expected CSV column names, or None if not found
+    """
+    key = (entity, source)
+    return EXPECTED_CSV_HEADERS.get(key)
+
+
+def validate_csv_headers(
+    actual_headers: List[str],
+    entity: str,
+    source: str,
+    strict: bool = False
+) -> Dict:
+    """
+    Validate CSV headers against expected headers for an entity/source combination.
+
+    This function checks that all REQUIRED headers are present in the CSV file.
+    Extra columns in the CSV are allowed (they will be skipped during loading).
+
+    Args:
+        actual_headers: List of headers found in the CSV file
+        entity: Entity type (e.g., 'HCM_PERSON_INTF')
+        source: Source system (e.g., 'FIMAS')
+        strict: If True, require EXACT match (no extra columns allowed)
+
+    Returns:
+        Dict with validation results:
+            - valid: bool - True if validation passed
+            - entity: str - The entity type
+            - source: str - The source system
+            - expected_headers: List[str] - Expected headers (or None if not defined)
+            - actual_headers: List[str] - Headers found in CSV
+            - missing_headers: List[str] - Required headers not found in CSV
+            - extra_headers: List[str] - Headers in CSV but not in expected list
+            - error: str - Error message if validation failed (or None)
+    """
+    result = {
+        'valid': False,
+        'entity': entity,
+        'source': source,
+        'expected_headers': None,
+        'actual_headers': actual_headers,
+        'missing_headers': [],
+        'extra_headers': [],
+        'error': None
+    }
+
+    # Get expected headers
+    expected = get_expected_headers(entity, source)
+
+    if expected is None:
+        # No expected headers defined for this entity/source combination
+        # This is not an error - just means we don't have validation rules
+        result['valid'] = True
+        result['error'] = f'No header validation rules defined for entity={entity}, source={source} (allowing all headers)'
+        return result
+
+    result['expected_headers'] = expected
+
+    # Normalize headers for comparison (strip whitespace, handle case)
+    actual_upper = {h.strip().upper(): h.strip() for h in actual_headers}
+    expected_upper = {h.upper(): h for h in expected}
+
+    # Find missing required headers
+    missing = []
+    for exp_header in expected:
+        if exp_header.upper() not in actual_upper:
+            missing.append(exp_header)
+
+    result['missing_headers'] = missing
+
+    # Find extra headers (in actual but not in expected)
+    extra = []
+    for actual_header in actual_headers:
+        if actual_header.strip().upper() not in expected_upper:
+            extra.append(actual_header.strip())
+
+    result['extra_headers'] = extra
+
+    # Determine if validation passed
+    if missing:
+        result['valid'] = False
+        result['error'] = f'Missing required CSV headers: {", ".join(missing)}'
+    elif strict and extra:
+        result['valid'] = False
+        result['error'] = f'Unexpected extra CSV headers (strict mode): {", ".join(extra)}'
+    else:
+        result['valid'] = True
+        if extra:
+            result['error'] = f'Extra columns will be ignored: {", ".join(extra)}'
+
+    return result
+
+
+def validate_file_headers(
+    s3_client,
+    bucket: str,
+    s3_key: str,
+    filename: str,
+    strict: bool = False
+) -> Dict:
+    """
+    Validate headers of a CSV file stored in S3.
+
+    Args:
+        s3_client: Boto3 S3 client
+        bucket: S3 bucket name
+        s3_key: S3 object key
+        filename: Original filename (used to extract entity/source)
+        strict: If True, require exact header match
+
+    Returns:
+        Dict with validation results (same format as validate_csv_headers)
+    """
+    result = {
+        'valid': False,
+        'filename': filename,
+        's3_key': s3_key,
+        'entity': None,
+        'source': None,
+        'expected_headers': None,
+        'actual_headers': [],
+        'missing_headers': [],
+        'extra_headers': [],
+        'error': None
+    }
+
+    try:
+        # Extract entity and source from filename
+        entity = extract_entity_from_filename(filename)
+        source = extract_source_from_filename(filename)
+
+        result['entity'] = entity
+        result['source'] = source
+
+        if not entity:
+            result['error'] = f'Could not determine entity type from filename: {filename}'
+            return result
+
+        if not source:
+            result['error'] = f'Could not determine source from filename: {filename}'
+            return result
+
+        # Read just the first line (headers) from S3
+        headers, _ = read_csv_data(s3_client, bucket, s3_key)
+        result['actual_headers'] = headers
+
+        if not headers:
+            result['error'] = 'No headers found in CSV file'
+            return result
+
+        # Validate headers
+        validation = validate_csv_headers(headers, entity, source, strict)
+
+        # Merge validation results
+        result.update(validation)
+        result['filename'] = filename
+        result['s3_key'] = s3_key
+
+        return result
+
+    except Exception as e:
+        result['error'] = f'Error reading file headers: {str(e)}'
+        return result
+
+
 def parse_connection_string(conn_str: str) -> Dict:
     """Parse ODBC connection string into components for pymssql."""
     params = {}
@@ -935,6 +1347,23 @@ def load_file_to_sql(
             result['error_type'] = 'NO_HEADERS'
             return result
 
+        # =====================================================================
+        # HEADER VALIDATION - Check CSV headers match expected format
+        # =====================================================================
+        header_validation = validate_csv_headers(headers, entity, source, strict=False)
+        result['header_validation'] = header_validation
+
+        if not header_validation['valid']:
+            result['error'] = f'Header validation failed: {header_validation["error"]}'
+            result['error_type'] = 'HEADER_VALIDATION_FAILED'
+            result['missing_headers'] = header_validation.get('missing_headers', [])
+            result['expected_headers'] = header_validation.get('expected_headers', [])
+            return result
+
+        # Log any extra headers that will be skipped
+        if header_validation.get('extra_headers'):
+            result['extra_headers_warning'] = f'Extra columns will be ignored: {header_validation["extra_headers"]}'
+
         # Parse connection string and connect
         conn_params = parse_connection_string(connection_string)
         with pymssql.connect(
@@ -967,6 +1396,9 @@ def load_file_to_sql(
             skipped_cols = []
             mapping_details = []  # Debug: show exactly what was mapped
 
+            # Track which DB columns are already mapped (to prevent duplicates)
+            mapped_db_cols = set()
+
             for i, csv_col in enumerate(headers):
                 csv_col_clean = csv_col.strip()
 
@@ -975,16 +1407,43 @@ def load_file_to_sql(
                     db_col = column_mapping[csv_col_clean]
                     # Verify the DB column exists
                     if db_col.upper() in db_cols_upper:
-                        col_indices.append((i, db_cols_upper[db_col.upper()]))
-                        mapping_details.append(f"{csv_col_clean} -> {db_col} (mapped)")
+                        actual_db_col = db_cols_upper[db_col.upper()]
+                        if actual_db_col.upper() not in mapped_db_cols:
+                            col_indices.append((i, actual_db_col))
+                            mapped_db_cols.add(actual_db_col.upper())
+                            mapping_details.append(f"{csv_col_clean} -> {db_col} (mapped)")
+                        else:
+                            skipped_cols.append(f"{csv_col_clean} (mapped to {db_col} but DB column already mapped)")
                     else:
                         skipped_cols.append(f"{csv_col_clean} (mapped to {db_col} but not in DB)")
                 elif csv_col_clean.upper() in db_cols_upper:
-                    # Direct match (no mapping needed)
-                    col_indices.append((i, db_cols_upper[csv_col_clean.upper()]))
-                    mapping_details.append(f"{csv_col_clean} -> {csv_col_clean} (direct)")
+                    # Direct match - but only if DB column not already mapped
+                    actual_db_col = db_cols_upper[csv_col_clean.upper()]
+                    if actual_db_col.upper() not in mapped_db_cols:
+                        col_indices.append((i, actual_db_col))
+                        mapped_db_cols.add(actual_db_col.upper())
+                        mapping_details.append(f"{csv_col_clean} -> {csv_col_clean} (direct)")
+                    else:
+                        skipped_cols.append(f"{csv_col_clean} (direct match but DB column already mapped via another CSV column)")
                 else:
                     skipped_cols.append(csv_col_clean)
+
+            # Handle dual-mappings: CSV columns that map to multiple DB columns
+            # These are specified with __ALSO__ syntax: 'SOURCE_COL__ALSO__TARGET_COL': 'TARGET_COL'
+            # This allows a single CSV column to populate multiple DB columns
+            headers_upper = {h.strip().upper(): idx for idx, h in enumerate(headers)}
+            for mapping_key, db_col in column_mapping.items():
+                if '__ALSO__' in mapping_key:
+                    # Parse: 'EMPL_CLASS__ALSO__WORKER_CATEGORY' -> source='EMPL_CLASS', target='WORKER_CATEGORY'
+                    source_csv_col = mapping_key.split('__ALSO__')[0].strip()
+                    if source_csv_col.upper() in headers_upper:
+                        csv_idx = headers_upper[source_csv_col.upper()]
+                        if db_col.upper() in db_cols_upper:
+                            actual_db_col = db_cols_upper[db_col.upper()]
+                            if actual_db_col.upper() not in mapped_db_cols:
+                                col_indices.append((csv_idx, actual_db_col))
+                                mapped_db_cols.add(actual_db_col.upper())
+                                mapping_details.append(f"{source_csv_col} -> {db_col} (dual-mapped via __ALSO__)")
 
             result['columns_matched'] = len(col_indices)
             result['columns_skipped'] = skipped_cols
@@ -1001,6 +1460,53 @@ def load_file_to_sql(
             if clear_existing and source != 'RHUM':
                 cursor.execute(f"DELETE FROM dbo.[{safe_table_name}]")
                 conn.commit()
+
+            # =================================================================
+            # DEDUPLICATION: Remove duplicate rows for HCM_PERSON_INTF and
+            # HCM_PERSON_NID_INTF tables by PERSON_NUMBER column.
+            # The stored procedure's INSERT INTO HCM_PERSON_LEGACY_TO_ORACLE_NUMBER
+            # fails with PRIMARY KEY violation if the source table has duplicate
+            # PERSON_NUMBERs. The DOE source uses DISTINCT but HACIENDA doesn't.
+            # =================================================================
+            dedup_entities = ['HCM_PERSON_INTF', 'HCM_PERSON_NID_INTF']
+            original_row_count = len(rows)
+
+            if entity in dedup_entities and rows:
+                # Find the index of the PERSON_NUMBER column in the mapped columns
+                person_number_idx = None
+                for mapped_idx, (csv_idx, db_col) in enumerate(col_indices):
+                    if db_col.upper() == 'PERSON_NUMBER':
+                        person_number_idx = csv_idx
+                        break
+
+                if person_number_idx is not None:
+                    # Deduplicate rows by PERSON_NUMBER, keeping the first occurrence
+                    seen_person_numbers = set()
+                    unique_rows = []
+                    duplicate_count = 0
+                    duplicate_person_numbers = []
+
+                    for row in rows:
+                        person_number = row[person_number_idx] if person_number_idx < len(row) else ''
+                        person_number_clean = str(person_number).strip()
+
+                        if person_number_clean not in seen_person_numbers:
+                            seen_person_numbers.add(person_number_clean)
+                            unique_rows.append(row)
+                        else:
+                            duplicate_count += 1
+                            if len(duplicate_person_numbers) < 10:
+                                duplicate_person_numbers.append(person_number_clean)
+
+                    rows = unique_rows
+
+                    if duplicate_count > 0:
+                        result['deduplication'] = {
+                            'original_rows': original_row_count,
+                            'unique_rows': len(rows),
+                            'duplicates_removed': duplicate_count,
+                            'sample_duplicate_person_numbers': duplicate_person_numbers
+                        }
 
             # Insert data
             if rows:
@@ -1224,6 +1730,83 @@ def load_to_sql_handler(event, context):
         )
 
         results = loader.load_files(files=files, drop_existing=clear_existing)
+
+        return {
+            'statusCode': 200,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps(results, default=str)
+        }
+
+    except Exception as e:
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps({'error': str(e)})
+        }
+
+
+def validate_headers_handler(event, context):
+    """
+    Lambda handler for validating CSV headers without loading data.
+
+    Useful for pre-flight checks before running the full pipeline.
+
+    Expected event format:
+    {
+        "files": [
+            {"filename": "HCM_PERSON_INTF_FIMAS_20251209.csv", "s3_key": "uploads/..."},
+            ...
+        ],
+        "bucket": "hacienda-sftp-downloads" (optional)
+    }
+    """
+    import os
+    import json
+
+    try:
+        if 'body' in event and event['body']:
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        else:
+            body = event
+
+        files = body.get('files', [])
+        bucket = body.get('bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
+
+        if not files:
+            return {
+                'statusCode': 400,
+                'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                'body': json.dumps({'error': 'No files provided'})
+            }
+
+        s3_client = boto3.client('s3', region_name='us-east-1')
+
+        results = {
+            'total_files': len(files),
+            'valid_files': 0,
+            'invalid_files': 0,
+            'validation_results': [],
+            'version': SQL_TABLE_LOADER_VERSION
+        }
+
+        for file_info in files:
+            filename = file_info.get('filename', '')
+            s3_key = file_info.get('s3_key') or file_info.get('key', '')
+
+            validation = validate_file_headers(
+                s3_client=s3_client,
+                bucket=bucket,
+                s3_key=s3_key,
+                filename=filename,
+                strict=False
+            )
+
+            results['validation_results'].append(validation)
+
+            if validation['valid']:
+                results['valid_files'] += 1
+            else:
+                results['invalid_files'] += 1
 
         return {
             'statusCode': 200,
