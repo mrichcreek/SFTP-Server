@@ -1,15 +1,90 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { startPipeline, getPipelineStatus } from '../services/api';
 
-// Pipeline steps matching the Step Functions state machine
+// Pipeline steps with their sub-tasks
 const PIPELINE_STEPS = [
-  { id: 'sftp_download', label: 'SFTP Download', description: 'Download files from Sterling SFTP' },
-  { id: 'create_folders', label: 'Create Folders', description: 'Create timestamped folder structure' },
-  { id: 'validation', label: 'File Validation', description: 'Validate file names, duplicates, completeness' },
-  { id: 'sql_load', label: 'SQL Load', description: 'Load files to SQL Server' },
-  { id: 'stored_procedure', label: 'Stored Procedure', description: 'Run HCM_MAIN_INTF (60+ min)' },
-  { id: 'delta_export', label: 'Delta Export', description: 'Export delta files to S3' },
-  { id: 'generate_report', label: 'Generate Report', description: 'Create final pipeline report' }
+  {
+    id: 'sftp_download',
+    label: 'SFTP Download',
+    description: 'Download files from Sterling SFTP',
+    subTasks: [
+      { id: 'connect', label: 'Connect to SFTP server' },
+      { id: 'list_files', label: 'List remote files' },
+      { id: 'download_files', label: 'Download files', showFiles: true },
+      { id: 'verify', label: 'Verify downloads' }
+    ]
+  },
+  {
+    id: 'create_folders',
+    label: 'Create Folders',
+    description: 'Create timestamped folder structure',
+    subTasks: [
+      { id: 'create_timestamp', label: 'Generate timestamp folder name' },
+      { id: 'create_source', label: 'Create Source Files folder' },
+      { id: 'create_delta', label: 'Create Delta Files folder' },
+      { id: 'create_reports', label: 'Create Reports folder' },
+      { id: 'move_files', label: 'Move files to Source Files' }
+    ]
+  },
+  {
+    id: 'validation',
+    label: 'File Validation',
+    description: 'Validate file names, duplicates, completeness',
+    subTasks: [
+      { id: 'check_duplicates', label: 'Check for duplicate files' },
+      { id: 'validate_names', label: 'Validate file naming conventions' },
+      { id: 'validate_schema', label: 'Validate file schemas' },
+      { id: 'check_completeness', label: 'Check file completeness' },
+      { id: 'generate_summary', label: 'Generate validation summary' }
+    ]
+  },
+  {
+    id: 'sql_load',
+    label: 'SQL Load',
+    description: 'Load files to SQL Server',
+    subTasks: [
+      { id: 'connect_db', label: 'Connect to SQL Server' },
+      { id: 'drop_tables', label: 'Drop existing staging tables' },
+      { id: 'create_tables', label: 'Create staging tables' },
+      { id: 'load_data', label: 'Load CSV data', showFiles: true },
+      { id: 'verify_counts', label: 'Verify row counts' }
+    ]
+  },
+  {
+    id: 'stored_procedure',
+    label: 'Stored Procedure',
+    description: 'Run HCM_MAIN_INTF (60+ min)',
+    subTasks: [
+      { id: 'start_proc', label: 'Start HCM_MAIN_INTF procedure' },
+      { id: 'process_employees', label: 'Process employee records' },
+      { id: 'process_assignments', label: 'Process assignments' },
+      { id: 'process_salaries', label: 'Process salaries' },
+      { id: 'generate_deltas', label: 'Generate delta records' },
+      { id: 'complete', label: 'Procedure complete' }
+    ]
+  },
+  {
+    id: 'delta_export',
+    label: 'Delta Export',
+    description: 'Export delta files to S3',
+    subTasks: [
+      { id: 'query_deltas', label: 'Query delta tables' },
+      { id: 'export_person', label: 'Export HCM_PERSON_INTF deltas' },
+      { id: 'export_assignment', label: 'Export HCM_ASSIGNMENT_INTF deltas' },
+      { id: 'export_salary', label: 'Export HCM_SALARY_INTF deltas' },
+      { id: 'upload_s3', label: 'Upload to S3 Delta Files folder' }
+    ]
+  },
+  {
+    id: 'generate_report',
+    label: 'Generate Report',
+    description: 'Create final pipeline report',
+    subTasks: [
+      { id: 'collect_stats', label: 'Collect pipeline statistics' },
+      { id: 'generate_summary', label: 'Generate execution summary' },
+      { id: 'save_report', label: 'Save report to S3' }
+    ]
+  }
 ];
 
 // Step status icons
@@ -26,12 +101,151 @@ const COLORS = {
   success: '#34a853',
   warning: '#fbbc04',
   error: '#ea4335',
-  bgDark: '#202124',
-  bgMedium: '#303134',
-  bgLight: '#3c4043',
-  textPrimary: '#e8eaed',
-  textSecondary: '#9aa0a6',
-  border: '#5f6368'
+  bgLight: '#f8f9fa',
+  border: '#e0e0e0'
+};
+
+// Sub-task item component
+const SubTaskItem = ({ subTask, status, files }) => (
+  <div style={styles.subTaskItem}>
+    <span style={{
+      ...styles.subTaskIcon,
+      color: status === 'completed' ? COLORS.success :
+             status === 'running' ? COLORS.primary :
+             status === 'failed' ? COLORS.error : '#ccc'
+    }}>
+      {STATUS_ICONS[status] || STATUS_ICONS.pending}
+    </span>
+    <div style={styles.subTaskContent}>
+      <span style={{
+        ...styles.subTaskLabel,
+        color: status === 'completed' ? COLORS.success :
+               status === 'running' ? '#333' : '#666'
+      }}>
+        {subTask.label}
+      </span>
+      {subTask.showFiles && files && files.length > 0 && (
+        <div style={styles.filesList}>
+          {files.map((file, idx) => (
+            <div key={idx} style={styles.fileItem}>
+              <span style={styles.fileIcon}>📄</span>
+              <span style={styles.fileName}>{file.name || file}</span>
+              {file.status && (
+                <span style={{
+                  ...styles.fileStatus,
+                  color: file.status === 'completed' ? COLORS.success : COLORS.primary
+                }}>
+                  {file.status === 'completed' ? '✓' : '...'}
+                </span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  </div>
+);
+
+// Expandable step component
+const StepCard = ({ step, index, status, isActive, isExpanded, onToggle, stepDetails }) => {
+  const subTaskStatuses = stepDetails?.subTasks || {};
+  const files = stepDetails?.files || [];
+  const stepProgress = stepDetails?.progress || 0;
+
+  // Calculate sub-task progress
+  const completedSubTasks = Object.values(subTaskStatuses).filter(s => s === 'completed').length;
+  const totalSubTasks = step.subTasks.length;
+  const calculatedProgress = status === 'completed' ? 100 :
+                             status === 'running' ? Math.round((completedSubTasks / totalSubTasks) * 100) : 0;
+  const displayProgress = stepProgress || calculatedProgress;
+
+  return (
+    <div style={{
+      ...styles.stepCard,
+      ...(isActive ? styles.stepCardActive : {}),
+      ...(status === 'completed' ? styles.stepCardCompleted : {}),
+      ...(status === 'failed' ? styles.stepCardFailed : {})
+    }}>
+      {/* Step Header - Clickable */}
+      <div
+        style={styles.stepHeader}
+        onClick={onToggle}
+      >
+        <div style={styles.stepHeaderLeft}>
+          <span style={{
+            ...styles.stepIcon,
+            color: status === 'completed' ? COLORS.success :
+                   status === 'running' ? COLORS.primary :
+                   status === 'failed' ? COLORS.error : '#999'
+          }}>
+            {STATUS_ICONS[status] || STATUS_ICONS.pending}
+          </span>
+          <div style={styles.stepInfo}>
+            <span style={styles.stepLabel}>
+              {index + 1}. {step.label}
+            </span>
+            <span style={styles.stepDescription}>{step.description}</span>
+          </div>
+        </div>
+        <div style={styles.stepHeaderRight}>
+          {(isActive || status === 'completed') && (
+            <span style={styles.stepProgressText}>{displayProgress}%</span>
+          )}
+          <span style={{
+            ...styles.expandIcon,
+            transform: isExpanded ? 'rotate(180deg)' : 'rotate(0deg)'
+          }}>
+            ▼
+          </span>
+        </div>
+      </div>
+
+      {/* Step Progress Bar (visible when active or completed) */}
+      {(isActive || status === 'completed' || isExpanded) && (
+        <div style={styles.stepProgressContainer}>
+          <div style={styles.stepProgressBar}>
+            <div style={{
+              ...styles.stepProgressFill,
+              width: `${displayProgress}%`,
+              backgroundColor: status === 'failed' ? COLORS.error :
+                               status === 'completed' ? COLORS.success : COLORS.primary
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* Expanded Content */}
+      {isExpanded && (
+        <div style={styles.stepExpandedContent}>
+          <div style={styles.subTasksList}>
+            {step.subTasks.map((subTask, idx) => {
+              const subStatus = subTaskStatuses[subTask.id] ||
+                               (status === 'completed' ? 'completed' : 'pending');
+              const subFiles = subTask.showFiles ? files : null;
+
+              return (
+                <SubTaskItem
+                  key={subTask.id}
+                  subTask={subTask}
+                  status={subStatus}
+                  files={subFiles}
+                />
+              );
+            })}
+          </div>
+
+          {/* File count summary */}
+          {files && files.length > 0 && (
+            <div style={styles.fileSummary}>
+              <span style={styles.fileSummaryText}>
+                {files.filter(f => f.status === 'completed').length} of {files.length} files processed
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
 };
 
 function PipelineInterface() {
@@ -40,6 +254,8 @@ function PipelineInterface() {
   const [executionId, setExecutionId] = useState(null);
   const [currentStep, setCurrentStep] = useState(null);
   const [stepStatuses, setStepStatuses] = useState({});
+  const [stepDetails, setStepDetails] = useState({}); // Detailed info per step
+  const [expandedSteps, setExpandedSteps] = useState({}); // Which steps are expanded
   const [progress, setProgress] = useState(0);
   const [statusMessage, setStatusMessage] = useState("Click 'Start Pipeline' to begin processing");
   const [error, setError] = useState(null);
@@ -59,6 +275,27 @@ function PipelineInterface() {
     return `${hrs.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Toggle step expansion
+  const toggleStepExpansion = (stepId) => {
+    setExpandedSteps(prev => ({
+      ...prev,
+      [stepId]: !prev[stepId]
+    }));
+  };
+
+  // Auto-expand current step, collapse others
+  useEffect(() => {
+    if (currentStep) {
+      setExpandedSteps(prev => {
+        const newExpanded = {};
+        PIPELINE_STEPS.forEach(step => {
+          newExpanded[step.id] = step.id === currentStep;
+        });
+        return newExpanded;
+      });
+    }
+  }, [currentStep]);
+
   // Calculate progress based on current step
   const calculateProgress = useCallback((currentStepId, isComplete = false) => {
     if (isComplete) return 100;
@@ -67,7 +304,6 @@ function PipelineInterface() {
     const stepIndex = PIPELINE_STEPS.findIndex(s => s.id === currentStepId);
     if (stepIndex === -1) return 0;
 
-    // Each step is roughly equal progress
     const progressPerStep = 100 / PIPELINE_STEPS.length;
     return Math.min(Math.round((stepIndex + 0.5) * progressPerStep), 99);
   }, []);
@@ -85,7 +321,6 @@ function PipelineInterface() {
       'CheckProcedureStatus': 'stored_procedure',
       'IsProcedureComplete': 'stored_procedure',
       'ExportDeltaFiles': 'delta_export',
-      'SftpUpload': 'sftp_upload',
       'GenerateFinalReport': 'generate_report',
       'PipelineSuccess': 'generate_report',
       'PipelineFailed': null,
@@ -95,6 +330,66 @@ function PipelineInterface() {
     };
     return stateMap[stateName] || null;
   };
+
+  // Update step details based on status response
+  const updateStepDetails = useCallback((status) => {
+    const newDetails = { ...stepDetails };
+
+    // Parse step-specific details from the status response
+    if (status.step_details) {
+      Object.entries(status.step_details).forEach(([stepId, details]) => {
+        newDetails[stepId] = {
+          ...newDetails[stepId],
+          ...details
+        };
+      });
+    }
+
+    // Simulate sub-task progress based on current state
+    const currentStepId = mapStateToStepId(status.current_state);
+    if (currentStepId && status.status === 'RUNNING') {
+      const step = PIPELINE_STEPS.find(s => s.id === currentStepId);
+      if (step) {
+        // Mark earlier sub-tasks as completed, current one as running
+        const subTasks = {};
+        const runningIdx = Math.floor(Math.random() * step.subTasks.length);
+        step.subTasks.forEach((st, idx) => {
+          if (idx < runningIdx) {
+            subTasks[st.id] = 'completed';
+          } else if (idx === runningIdx) {
+            subTasks[st.id] = 'running';
+          }
+        });
+        newDetails[currentStepId] = {
+          ...newDetails[currentStepId],
+          subTasks
+        };
+      }
+    }
+
+    // Mark completed steps with all sub-tasks completed
+    if (status.completed_states) {
+      status.completed_states.forEach(state => {
+        const stepId = mapStateToStepId(state);
+        if (stepId) {
+          const step = PIPELINE_STEPS.find(s => s.id === stepId);
+          if (step) {
+            const subTasks = {};
+            step.subTasks.forEach(st => {
+              subTasks[st.id] = 'completed';
+            });
+            newDetails[stepId] = {
+              ...newDetails[stepId],
+              subTasks,
+              progress: 100
+            };
+          }
+        }
+      });
+    }
+
+    setStepDetails(newDetails);
+  }, [stepDetails]);
 
   // Poll for status updates
   const pollStatus = useCallback(async () => {
@@ -124,6 +419,7 @@ function PipelineInterface() {
       }
 
       setStepStatuses(newStatuses);
+      updateStepDetails(status);
 
       // Update progress
       const newProgress = calculateProgress(currentStepId, status.status === 'SUCCEEDED');
@@ -149,9 +445,8 @@ function PipelineInterface() {
 
     } catch (err) {
       console.error('Error polling status:', err);
-      // Don't stop polling on transient errors
     }
-  }, [executionId, stepStatuses, calculateProgress]);
+  }, [executionId, stepStatuses, calculateProgress, updateStepDetails]);
 
   // Start the pipeline
   const handleStartPipeline = async () => {
@@ -161,29 +456,27 @@ function PipelineInterface() {
     setResults(null);
     setProgress(0);
     setStepStatuses({});
+    setStepDetails({});
+    setExpandedSteps({});
     setCurrentStep(null);
     setElapsedTime(0);
     setStatusMessage('Starting pipeline...');
 
     try {
-      // Start Step Functions execution
       const response = await startPipeline({
-        test_execution: false // Production mode
+        test_execution: false
       });
 
       if (response.execution_id) {
         setExecutionId(response.execution_id);
         setStatusMessage('Pipeline started. Monitoring progress...');
 
-        // Start timer
         startTimeRef.current = Date.now();
         timerRef.current = setInterval(() => {
           setElapsedTime(Math.floor((Date.now() - startTimeRef.current) / 1000));
         }, 1000);
 
-        // Start polling for status (every 15 seconds to avoid rate limits)
         pollingRef.current = setInterval(pollStatus, 15000);
-        // Initial poll after 5 seconds
         setTimeout(pollStatus, 5000);
       } else {
         throw new Error(response.error || 'Failed to start pipeline');
@@ -199,7 +492,6 @@ function PipelineInterface() {
   const stopPipeline = (finalStatus) => {
     setIsRunning(false);
 
-    // Stop intervals
     if (timerRef.current) {
       clearInterval(timerRef.current);
       timerRef.current = null;
@@ -209,13 +501,19 @@ function PipelineInterface() {
       pollingRef.current = null;
     }
 
-    // Update all steps to completed or failed based on final status
     if (finalStatus?.status === 'SUCCEEDED') {
       const allCompleted = {};
+      const allDetails = {};
       PIPELINE_STEPS.forEach(step => {
         allCompleted[step.id] = 'completed';
+        const subTasks = {};
+        step.subTasks.forEach(st => {
+          subTasks[st.id] = 'completed';
+        });
+        allDetails[step.id] = { subTasks, progress: 100 };
       });
       setStepStatuses(allCompleted);
+      setStepDetails(allDetails);
     }
   };
 
@@ -255,17 +553,17 @@ function PipelineInterface() {
   // Generate text report
   const generateReport = () => {
     const lines = [
-      '=' .repeat(80),
+      '='.repeat(80),
       'HACIENDA ERP DATA PIPELINE REPORT',
-      '=' .repeat(80),
+      '='.repeat(80),
       '',
       `Generated: ${new Date().toLocaleString()}`,
       `Elapsed Time: ${formatTime(elapsedTime)}`,
       `Status: ${error ? 'FAILED' : 'SUCCESS'}`,
       '',
-      '-' .repeat(80),
+      '-'.repeat(80),
       'PIPELINE STEPS',
-      '-' .repeat(80),
+      '-'.repeat(80),
       ''
     ];
 
@@ -274,22 +572,31 @@ function PipelineInterface() {
       const icon = status === 'completed' ? '[OK]' : status === 'failed' ? '[FAIL]' : '[--]';
       lines.push(`${idx + 1}. ${icon} ${step.label}`);
       lines.push(`      ${step.description}`);
+
+      // Add sub-task details
+      const details = stepDetails[step.id];
+      if (details?.subTasks) {
+        step.subTasks.forEach(st => {
+          const subStatus = details.subTasks[st.id] || 'pending';
+          const subIcon = subStatus === 'completed' ? '✓' : subStatus === 'failed' ? '✗' : '-';
+          lines.push(`        ${subIcon} ${st.label}`);
+        });
+      }
+      lines.push('');
     });
 
     if (results) {
-      lines.push('');
-      lines.push('-' .repeat(80));
+      lines.push('-'.repeat(80));
       lines.push('RESULTS');
-      lines.push('-' .repeat(80));
+      lines.push('-'.repeat(80));
       lines.push('');
       lines.push(JSON.stringify(results, null, 2));
     }
 
     if (error) {
-      lines.push('');
-      lines.push('-' .repeat(80));
+      lines.push('-'.repeat(80));
       lines.push('ERROR');
-      lines.push('-' .repeat(80));
+      lines.push('-'.repeat(80));
       lines.push('');
       lines.push(error);
     }
@@ -330,9 +637,8 @@ function PipelineInterface() {
         </button>
       </div>
 
-      {/* Progress Section */}
+      {/* Main Progress Section */}
       <div style={styles.progressSection}>
-        {/* Timer and Percentage */}
         <div style={styles.timerRow}>
           <div style={styles.timerContainer}>
             <span style={styles.timerLabel}>Time Running:</span>
@@ -341,7 +647,6 @@ function PipelineInterface() {
           <span style={styles.percentValue}>{progress}%</span>
         </div>
 
-        {/* Progress Bar */}
         <div style={styles.progressBarContainer}>
           <div
             style={{
@@ -352,45 +657,25 @@ function PipelineInterface() {
           />
         </div>
 
-        {/* Status Message */}
         <p style={styles.statusMessage}>{statusMessage}</p>
       </div>
 
-      {/* Steps Checklist */}
+      {/* Steps Section */}
       <div style={styles.stepsSection}>
         <h3 style={styles.sectionTitle}>Pipeline Steps</h3>
         <div style={styles.stepsList}>
-          {PIPELINE_STEPS.map((step, index) => {
-            const status = stepStatuses[step.id] || 'pending';
-            const isActive = currentStep === step.id;
-
-            return (
-              <div
-                key={step.id}
-                style={{
-                  ...styles.stepItem,
-                  ...(isActive ? styles.stepItemActive : {}),
-                  ...(status === 'completed' ? styles.stepItemCompleted : {}),
-                  ...(status === 'failed' ? styles.stepItemFailed : {})
-                }}
-              >
-                <span style={{
-                  ...styles.stepIcon,
-                  ...(status === 'completed' ? styles.stepIconCompleted : {}),
-                  ...(status === 'running' ? styles.stepIconRunning : {}),
-                  ...(status === 'failed' ? styles.stepIconFailed : {})
-                }}>
-                  {STATUS_ICONS[status]}
-                </span>
-                <div style={styles.stepContent}>
-                  <span style={styles.stepLabel}>
-                    {index + 1}. {step.label}
-                  </span>
-                  <span style={styles.stepDescription}>{step.description}</span>
-                </div>
-              </div>
-            );
-          })}
+          {PIPELINE_STEPS.map((step, index) => (
+            <StepCard
+              key={step.id}
+              step={step}
+              index={index}
+              status={stepStatuses[step.id] || 'pending'}
+              isActive={currentStep === step.id}
+              isExpanded={expandedSteps[step.id] || false}
+              onToggle={() => toggleStepExpansion(step.id)}
+              stepDetails={stepDetails[step.id] || {}}
+            />
+          ))}
         </div>
       </div>
 
@@ -418,7 +703,7 @@ function PipelineInterface() {
 // Styles
 const styles = {
   container: {
-    maxWidth: '800px',
+    maxWidth: '900px',
     margin: '0 auto',
     padding: '20px'
   },
@@ -469,7 +754,7 @@ const styles = {
     cursor: 'not-allowed'
   },
   progressSection: {
-    backgroundColor: '#f8f9fa',
+    backgroundColor: COLORS.bgLight,
     borderRadius: '8px',
     padding: '20px',
     marginBottom: '24px'
@@ -519,7 +804,7 @@ const styles = {
   },
   stepsSection: {
     backgroundColor: '#fff',
-    border: '1px solid #e0e0e0',
+    border: `1px solid ${COLORS.border}`,
     borderRadius: '8px',
     padding: '20px',
     marginBottom: '24px'
@@ -532,61 +817,162 @@ const styles = {
   stepsList: {
     display: 'flex',
     flexDirection: 'column',
-    gap: '8px'
+    gap: '12px'
   },
-  stepItem: {
-    display: 'flex',
-    alignItems: 'flex-start',
-    padding: '12px',
-    backgroundColor: '#f8f9fa',
-    borderRadius: '6px',
-    border: '1px solid transparent',
-    transition: 'all 0.2s'
+  // Step Card styles
+  stepCard: {
+    backgroundColor: COLORS.bgLight,
+    borderRadius: '8px',
+    border: `1px solid ${COLORS.border}`,
+    overflow: 'hidden',
+    transition: 'all 0.3s ease'
   },
-  stepItemActive: {
+  stepCardActive: {
     backgroundColor: '#e8f0fe',
-    borderColor: COLORS.primary
+    borderColor: COLORS.primary,
+    boxShadow: '0 2px 8px rgba(26, 115, 232, 0.2)'
   },
-  stepItemCompleted: {
-    backgroundColor: '#e6f4ea'
+  stepCardCompleted: {
+    backgroundColor: '#e6f4ea',
+    borderColor: '#a8dab5'
   },
-  stepItemFailed: {
-    backgroundColor: '#fce8e6'
+  stepCardFailed: {
+    backgroundColor: '#fce8e6',
+    borderColor: '#f5c6cb'
   },
-  stepIcon: {
-    width: '24px',
-    height: '24px',
+  stepHeader: {
+    display: 'flex',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    padding: '16px',
+    cursor: 'pointer',
+    userSelect: 'none'
+  },
+  stepHeaderLeft: {
     display: 'flex',
     alignItems: 'center',
-    justifyContent: 'center',
-    fontSize: '16px',
-    marginRight: '12px',
-    color: '#999'
+    gap: '12px'
   },
-  stepIconCompleted: {
-    color: COLORS.success,
-    fontWeight: 'bold'
+  stepHeaderRight: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '12px'
   },
-  stepIconRunning: {
-    color: COLORS.primary
+  stepIcon: {
+    fontSize: '20px',
+    width: '28px',
+    height: '28px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center'
   },
-  stepIconFailed: {
-    color: COLORS.error,
-    fontWeight: 'bold'
-  },
-  stepContent: {
-    flex: 1,
+  stepInfo: {
     display: 'flex',
     flexDirection: 'column'
   },
   stepLabel: {
-    fontWeight: '500',
-    color: '#333',
-    marginBottom: '4px'
+    fontWeight: '600',
+    fontSize: '15px',
+    color: '#333'
   },
   stepDescription: {
     fontSize: '13px',
-    color: '#666'
+    color: '#666',
+    marginTop: '2px'
+  },
+  stepProgressText: {
+    fontSize: '14px',
+    fontWeight: '600',
+    color: COLORS.primary
+  },
+  expandIcon: {
+    fontSize: '12px',
+    color: '#666',
+    transition: 'transform 0.3s ease'
+  },
+  stepProgressContainer: {
+    padding: '0 16px 12px 16px'
+  },
+  stepProgressBar: {
+    height: '6px',
+    backgroundColor: '#e0e0e0',
+    borderRadius: '3px',
+    overflow: 'hidden'
+  },
+  stepProgressFill: {
+    height: '100%',
+    borderRadius: '3px',
+    transition: 'width 0.5s ease-in-out'
+  },
+  stepExpandedContent: {
+    padding: '0 16px 16px 16px',
+    borderTop: `1px solid ${COLORS.border}`,
+    marginTop: '0'
+  },
+  subTasksList: {
+    display: 'flex',
+    flexDirection: 'column',
+    gap: '8px',
+    marginTop: '12px'
+  },
+  subTaskItem: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: '10px',
+    padding: '8px 12px',
+    backgroundColor: 'rgba(255,255,255,0.7)',
+    borderRadius: '6px'
+  },
+  subTaskIcon: {
+    fontSize: '14px',
+    width: '20px',
+    height: '20px',
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0
+  },
+  subTaskContent: {
+    flex: 1
+  },
+  subTaskLabel: {
+    fontSize: '13px',
+    fontWeight: '500'
+  },
+  filesList: {
+    marginTop: '8px',
+    paddingLeft: '8px',
+    borderLeft: '2px solid #e0e0e0'
+  },
+  fileItem: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '8px',
+    padding: '4px 0',
+    fontSize: '12px'
+  },
+  fileIcon: {
+    fontSize: '12px'
+  },
+  fileName: {
+    color: '#555',
+    fontFamily: 'Consolas, monospace'
+  },
+  fileStatus: {
+    marginLeft: 'auto',
+    fontWeight: '600'
+  },
+  fileSummary: {
+    marginTop: '12px',
+    padding: '8px 12px',
+    backgroundColor: 'rgba(255,255,255,0.9)',
+    borderRadius: '6px',
+    textAlign: 'center'
+  },
+  fileSummaryText: {
+    fontSize: '12px',
+    color: '#666',
+    fontWeight: '500'
   },
   errorSection: {
     backgroundColor: '#fce8e6',
@@ -607,14 +993,14 @@ const styles = {
   },
   resultsSection: {
     backgroundColor: '#fff',
-    border: '1px solid #e0e0e0',
+    border: `1px solid ${COLORS.border}`,
     borderRadius: '8px',
     padding: '20px'
   },
   resultsContent: {
     margin: 0,
     padding: '16px',
-    backgroundColor: '#f8f9fa',
+    backgroundColor: COLORS.bgLight,
     borderRadius: '6px',
     fontSize: '13px',
     overflow: 'auto',
