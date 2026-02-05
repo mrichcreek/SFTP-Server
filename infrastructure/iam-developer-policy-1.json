@@ -1,0 +1,1 @@
+{"Version":"2012-10-17","Statement":[{"Sid":"Core","Effect":"Allow","Action":["states:*","cloudformation:*","lambda:*","logs:*","events:*"],"Resource":"*"},{"Sid":"APIGW","Effect":"Allow","Action":["apigateway:GET","apigateway:POST","apigateway:PUT","apigateway:PATCH","apigateway:DELETE"],"Resource":"*"}]}

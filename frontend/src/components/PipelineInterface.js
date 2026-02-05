@@ -9,7 +9,6 @@ const PIPELINE_STEPS = [
   { id: 'sql_load', label: 'SQL Load', description: 'Load files to SQL Server' },
   { id: 'stored_procedure', label: 'Stored Procedure', description: 'Run HCM_MAIN_INTF (60+ min)' },
   { id: 'delta_export', label: 'Delta Export', description: 'Export delta files to S3' },
-  { id: 'sftp_upload', label: 'SFTP Upload', description: 'Upload files to Sterling' },
   { id: 'generate_report', label: 'Generate Report', description: 'Create final pipeline report' }
 ];
 

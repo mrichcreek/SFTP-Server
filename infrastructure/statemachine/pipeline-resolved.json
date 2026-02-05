@@ -220,35 +220,6 @@
           "Next": "PipelineFailed"
         }
       ],
-      "Next": "SftpUpload"
-    },
-
-    "SftpUpload": {
-      "Type": "Task",
-      "Resource": "arn:aws:lambda:us-east-1:087243890715:function:hacienda-pipeline-orchestrator-prod",
-      "Parameters": {
-        "action": "upload",
-        "sftp_secret": "Sterling_SFTP_Direct_Production",
-        "remote_folder": "/GPR/HCM/INPUT",
-        "export_folder.$": "$.exportResult.output_prefix",
-        "s3_bucket.$": "$.s3_bucket"
-      },
-      "ResultPath": "$.uploadResult",
-      "TimeoutSeconds": 600,
-      "Retry": [
-        {
-          "ErrorEquals": ["Lambda.ServiceException"],
-          "IntervalSeconds": 5,
-          "MaxAttempts": 2
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": ["States.ALL"],
-          "ResultPath": "$.error",
-          "Next": "PipelineFailed"
-        }
-      ],
       "Next": "GenerateFinalReport"
     },
 
@@ -264,8 +235,7 @@
         "validation.$": "$.validationResult",
         "sql_load.$": "$.sqlLoadResult",
         "proc_status.$": "$.procStatus",
-        "export.$": "$.exportResult",
-        "upload.$": "$.uploadResult"
+        "export.$": "$.exportResult"
       },
       "ResultPath": "$.finalReport",
       "Next": "PipelineSuccess"
@@ -273,7 +243,7 @@
 
     "PipelineSuccess": {
       "Type": "Succeed",
-      "Comment": "Pipeline completed successfully"
+      "Comment": "Pipeline completed successfully - delta files saved to S3"
     },
 
     "ProcedureFailed": {
