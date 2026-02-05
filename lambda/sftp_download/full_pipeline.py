@@ -138,7 +138,7 @@ class FullPipelineOrchestrator:
     Usage:
         orchestrator = FullPipelineOrchestrator(
             bucket='hacienda-sftp-downloads',
-            secret_name='Hacienda_ERP_Test_MSSQL_text'
+            secret_name='Hacienda_ERP_MSSQL_Production'
         )
         result = orchestrator.run_pipeline(
             environment='test',
@@ -177,7 +177,7 @@ class FullPipelineOrchestrator:
     def __init__(
         self,
         bucket: str = None,
-        secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+        secret_name: str = 'Hacienda_ERP_MSSQL_Production',
         region: str = 'us-east-1'
     ):
         self.bucket = bucket or os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
@@ -1642,7 +1642,7 @@ def _run_diagnostics(body):
 
     # 3. Try to connect to database and get table columns
     try:
-        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
+        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production')
         connection_string = get_aws_secret(secret_name)
         conn_params = parse_connection_string(connection_string)
 
@@ -1844,7 +1844,7 @@ def run_full_pipeline_handler(event, context):
 
         # Get bucket from environment variable
         bucket = os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
-        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
+        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production')
 
         # Test S3 connectivity first
         try:
@@ -1900,6 +1900,164 @@ def run_full_pipeline_handler(event, context):
                 'error': str(e),
                 'traceback': traceback.format_exc()
             })
+        }
+
+
+def pipeline_step_handler(event, context):
+    """
+    Lambda handler for Step Functions pipeline steps.
+    This is a multi-purpose handler that routes based on the 'action' parameter.
+
+    Called by Step Functions state machine for various pipeline steps:
+    - download: SFTP download from Sterling
+    - create_folders: Create timestamped folder structure
+    - full_validation: Run duplicate check, name validation, schema validation, completeness
+    - load_files: Load validated files to SQL Server
+    - generate_report: Generate validation error or success report
+
+    Input format (from Step Functions):
+    {
+        "action": "download|create_folders|full_validation|load_files|generate_report",
+        "s3_bucket": "hacienda-sftp-downloads",
+        "folder": "20240115_1030" (optional, for steps after create_folders),
+        "sftp_secret": "Sterling_SFTP_Direct_Production",
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        ...other action-specific params
+    }
+    """
+    try:
+        action = event.get('action', 'unknown')
+        bucket = event.get('s3_bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
+
+        result = {
+            'action': action,
+            'timestamp': datetime.now().isoformat(),
+            's3_bucket': bucket
+        }
+
+        if action == 'test_connectivity':
+            # Test network connectivity
+            import socket
+            import urllib.request
+
+            tests = {}
+
+            # Test DNS resolution
+            try:
+                tests['google_dns'] = socket.gethostbyname('google.com')
+            except Exception as e:
+                tests['google_dns'] = f'Error: {e}'
+
+            # Test HTTPS connection
+            try:
+                response = urllib.request.urlopen('https://httpbin.org/ip', timeout=10)
+                tests['httpbin_ip'] = response.read().decode()
+            except Exception as e:
+                tests['httpbin_ip'] = f'Error: {e}'
+
+            # Test Sterling SFTP port
+            sftp_host = event.get('sftp_host', '64.185.194.10')
+            sftp_port = event.get('sftp_port', 22)
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(15)
+                result_code = sock.connect_ex((sftp_host, sftp_port))
+                if result_code == 0:
+                    tests['sterling_sftp'] = f'Port {sftp_port} is OPEN on {sftp_host}'
+                else:
+                    tests['sterling_sftp'] = f'Port {sftp_port} connection to {sftp_host} failed with error code: {result_code}'
+                sock.close()
+            except Exception as e:
+                tests['sterling_sftp'] = f'Error: {e}'
+
+            result['connectivity_tests'] = tests
+            result['success'] = True
+
+        elif action == 'download':
+            # SFTP Download from Sterling
+            sftp_secret = event.get('sftp_secret', 'Sterling_SFTP_Direct_Production')
+            remote_folder = event.get('remote_folder', '/GPR/HCM')
+
+            try:
+                from .sftp_downloader import download_from_sftp
+            except ImportError:
+                from sftp_download.sftp_downloader import download_from_sftp
+
+            download_result = download_from_sftp(
+                bucket=bucket,
+                sftp_secret_name=sftp_secret,
+                remote_folder=remote_folder,
+                s3_prefix='downloads/'
+            )
+            result.update(download_result)
+
+        elif action == 'create_folders':
+            # Create timestamped folder and organize files
+            source_prefix = event.get('source_prefix', 'downloads/')
+
+            orchestrator = FullPipelineOrchestrator(bucket=bucket)
+            folder_result = orchestrator.create_timestamped_folder(source_prefix)
+
+            result['folder_name'] = folder_result.get('folder_name')
+            result['files_moved'] = folder_result.get('files_moved', 0)
+            result['success'] = folder_result.get('success', False)
+
+        elif action == 'full_validation':
+            # Run all validation steps
+            folder = event.get('folder')
+            if not folder:
+                raise ValueError("folder parameter required for full_validation")
+
+            orchestrator = FullPipelineOrchestrator(bucket=bucket)
+
+            # Run validation steps
+            validation_result = orchestrator.run_validation_steps(folder)
+
+            result['validation_passed'] = validation_result.get('all_passed', False)
+            result['has_critical_errors'] = validation_result.get('has_critical_errors', False)
+            result['duplicate_check'] = validation_result.get('duplicate_check', {})
+            result['name_validation'] = validation_result.get('name_validation', {})
+            result['schema_validation'] = validation_result.get('schema_validation', {})
+            result['completeness_check'] = validation_result.get('completeness_check', {})
+            result['valid_files'] = validation_result.get('valid_files', [])
+
+        elif action == 'load_files':
+            # Load validated files to SQL Server
+            folder = event.get('folder')
+            sql_secret = event.get('sql_secret', 'Hacienda_ERP_MSSQL_Production')
+            database = event.get('database', 'Hacienda_ERP')
+
+            if not folder:
+                raise ValueError("folder parameter required for load_files")
+
+            orchestrator = FullPipelineOrchestrator(
+                bucket=bucket,
+                secret_name=sql_secret
+            )
+
+            load_result = orchestrator.load_files_to_sql(folder, database)
+            result.update(load_result)
+
+        elif action in ['validation_error', 'procedure_error', 'pipeline_success']:
+            # Generate report - just acknowledge, report is in the state
+            result['report_type'] = action
+            result['success'] = True
+            result['message'] = f"Report type: {action}"
+
+        else:
+            result['error'] = f"Unknown action: {action}"
+            result['success'] = False
+
+        return result
+
+    except Exception as e:
+        import traceback
+        return {
+            'action': event.get('action', 'unknown'),
+            'error': str(e),
+            'error_type': type(e).__name__,
+            'traceback': traceback.format_exc(),
+            'success': False
         }
 
 

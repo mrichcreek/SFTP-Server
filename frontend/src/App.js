@@ -1,16 +1,13 @@
-import React, { useState } from 'react';
+import React from 'react';
 import { Amplify } from 'aws-amplify';
 import { Authenticator } from '@aws-amplify/ui-react';
 import '@aws-amplify/ui-react/styles.css';
 import awsconfig from './aws-exports';
-import DownloadButton from './components/DownloadButton';
-import ValidationPanel from './components/ValidationPanel';
+import PipelineInterface from './components/PipelineInterface';
 
 Amplify.configure(awsconfig);
 
 function App() {
-  const [activeSection, setActiveSection] = useState('download');
-
   return (
     <div style={styles.appContainer}>
       <Authenticator>
@@ -28,43 +25,10 @@ function App() {
               </div>
             </header>
 
-            <nav style={styles.nav}>
-              <button
-                style={activeSection === 'download' ? styles.navButtonActive : styles.navButton}
-                onClick={() => setActiveSection('download')}
-              >
-                File Download
-              </button>
-              <button
-                style={activeSection === 'validation' ? styles.navButtonActive : styles.navButton}
-                onClick={() => setActiveSection('validation')}
-              >
-                Validation & Processing
-              </button>
-            </nav>
-
             <main style={styles.main}>
-              {activeSection === 'download' && (
-                <div style={styles.card}>
-                  <h2 style={styles.cardTitle}>File Download</h2>
-                  <p style={styles.cardDescription}>
-                    Click the button below to download files from the SFTP server.
-                    Files will be securely transferred to S3 storage.
-                  </p>
-                  <DownloadButton />
-                </div>
-              )}
-
-              {activeSection === 'validation' && (
-                <div style={styles.wideCard}>
-                  <h2 style={styles.cardTitle}>File Validation & Processing</h2>
-                  <p style={styles.cardDescription}>
-                    Validate downloaded files, check for completeness, detect duplicates,
-                    and process files through the complete workflow.
-                  </p>
-                  <ValidationPanel />
-                </div>
-              )}
+              <div style={styles.card}>
+                <PipelineInterface />
+              </div>
             </main>
 
             <footer style={styles.footer}>
@@ -116,31 +80,6 @@ const styles = {
     cursor: 'pointer',
     fontSize: '14px'
   },
-  nav: {
-    backgroundColor: '#37475a',
-    padding: '0 24px',
-    display: 'flex',
-    gap: '4px'
-  },
-  navButton: {
-    padding: '14px 20px',
-    backgroundColor: 'transparent',
-    color: '#adb5bd',
-    border: 'none',
-    cursor: 'pointer',
-    fontSize: '14px',
-    borderBottom: '3px solid transparent'
-  },
-  navButtonActive: {
-    padding: '14px 20px',
-    backgroundColor: 'transparent',
-    color: 'white',
-    border: 'none',
-    cursor: 'pointer',
-    fontSize: '14px',
-    fontWeight: 'bold',
-    borderBottom: '3px solid #ff9900'
-  },
   main: {
     flex: 1,
     padding: '40px 24px',
@@ -153,27 +92,8 @@ const styles = {
     borderRadius: '12px',
     padding: '32px',
     boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-    maxWidth: '600px',
-    width: '100%',
-    textAlign: 'center'
-  },
-  wideCard: {
-    backgroundColor: 'white',
-    borderRadius: '12px',
-    padding: '32px',
-    boxShadow: '0 2px 8px rgba(0,0,0,0.1)',
-    maxWidth: '1000px',
-    width: '100%',
-    textAlign: 'left'
-  },
-  cardTitle: {
-    margin: '0 0 16px 0',
-    color: '#232f3e'
-  },
-  cardDescription: {
-    color: '#666',
-    marginBottom: '24px',
-    lineHeight: '1.5'
+    maxWidth: '900px',
+    width: '100%'
   },
   footer: {
     backgroundColor: '#232f3e',

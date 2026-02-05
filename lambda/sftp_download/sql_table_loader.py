@@ -1617,7 +1617,7 @@ class SqlServerLoader:
     def __init__(
         self,
         bucket: str = None,
-        secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+        secret_name: str = 'Hacienda_ERP_MSSQL_Production',
         database_override: Optional[str] = None,
         region: str = 'us-east-1'
     ):

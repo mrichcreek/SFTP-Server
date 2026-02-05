@@ -2,6 +2,8 @@ import { fetchAuthSession } from 'aws-amplify/auth';
 import awsconfig from '../aws-exports';
 
 const API_ENDPOINT = awsconfig.API.REST.haciendaApi.endpoint;
+// Direct Lambda function URL for full-pipeline (bypasses API Gateway)
+const FULL_PIPELINE_URL = 'https://5253fdqsppqvdveoyaeq6dl7ty0pmjep.lambda-url.us-east-1.on.aws';
 
 async function getAuthHeaders() {
   try {
@@ -352,16 +354,20 @@ export async function getProcedureStatus(environment = 'test') {
  * @param {string} sourcePrefix - S3 prefix where source files are located
  * @returns {Promise} Pipeline execution results with step details
  */
-export async function runFullPipeline(environment = 'test', testMode = true, sourcePrefix = 'downloads/') {
-  const headers = await getAuthHeaders();
+export async function runFullPipeline(environment = 'test', testMode = true, sourcePrefix = 'downloads/', skipSftp = false) {
+  // Full pipeline uses direct Lambda URL (no API Gateway auth required)
+  const headers = {
+    'Content-Type': 'application/json'
+  };
 
-  const response = await fetch(`${API_ENDPOINT}/full-pipeline`, {
+  const response = await fetch(FULL_PIPELINE_URL, {
     method: 'POST',
     headers,
     body: JSON.stringify({
       environment,
       test_mode: testMode,
-      source_prefix: sourcePrefix
+      source_prefix: sourcePrefix,
+      skip_sftp: skipSftp
     })
   });
 
@@ -388,6 +394,104 @@ export async function listPipelineFolders() {
   if (!response.ok) {
     const error = await response.json();
     throw new Error(error.message || 'Failed to list pipeline folders');
+  }
+
+  return response.json();
+}
+
+// ============================================================================
+// Step Functions Pipeline API
+// ============================================================================
+
+/**
+ * Start the full pipeline via Step Functions
+ * This initiates the AWS Step Functions state machine execution
+ * @param {object} options - Pipeline options
+ * @param {boolean} options.test_execution - If true, run stored procedure in test mode
+ * @returns {Promise} Execution details including execution_id
+ */
+export async function startPipeline(options = {}) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/start-pipeline`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      test_execution: options.test_execution || false,
+      s3_bucket: options.s3_bucket || 'hacienda-sftp-downloads'
+    })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to start pipeline');
+  }
+
+  return response.json();
+}
+
+/**
+ * Get pipeline execution status from Step Functions
+ * @param {string} executionId - The Step Functions execution ID/ARN
+ * @returns {Promise} Execution status including current state, history, output
+ */
+export async function getPipelineStatus(executionId) {
+  const headers = await getAuthHeaders();
+
+  // URL-encode the execution ID in case it contains special characters
+  const encodedId = encodeURIComponent(executionId);
+
+  const response = await fetch(`${API_ENDPOINT}/pipeline-status/${encodedId}`, {
+    method: 'GET',
+    headers
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to get pipeline status');
+  }
+
+  return response.json();
+}
+
+/**
+ * Stop a running pipeline execution
+ * @param {string} executionId - The Step Functions execution ID/ARN
+ * @returns {Promise} Stop result
+ */
+export async function stopPipeline(executionId) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/stop-pipeline`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ execution_id: executionId })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to stop pipeline');
+  }
+
+  return response.json();
+}
+
+/**
+ * List recent pipeline executions
+ * @param {number} maxResults - Maximum number of results (default 10)
+ * @returns {Promise} List of recent executions
+ */
+export async function listPipelineExecutions(maxResults = 10) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/pipeline-executions?max_results=${maxResults}`, {
+    method: 'GET',
+    headers
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to list pipeline executions');
   }
 
   return response.json();

@@ -45,7 +45,7 @@ class DeltaExporter:
     def __init__(
         self,
         bucket: str,
-        secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+        secret_name: str = 'Hacienda_ERP_MSSQL_Production',
         database_override: Optional[str] = None,
         output_prefix: str = 'exports/'
     ):
@@ -403,7 +403,7 @@ class DeltaExporter:
 
 def export_delta_files(
     bucket: str,
-    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
     database_override: Optional[str] = None,
     output_prefix: str = 'exports/',
     update_status: bool = True
@@ -428,3 +428,88 @@ def export_delta_files(
         output_prefix=output_prefix
     )
     return exporter.export_all(update_status=update_status)
+
+
+def export_handler(event, context):
+    """
+    Lambda handler for delta export - called by Step Functions.
+
+    Input (from Step Functions):
+    {
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        "database": "Hacienda_ERP",
+        "folder": "20240115_1030",
+        "s3_bucket": "hacienda-sftp-downloads"
+    }
+
+    Returns:
+    {
+        "statusCode": 200,
+        "body": {
+            "status": "success",
+            "files_exported": 12,
+            "total_rows": 1500,
+            "output_prefix": "20240115_1030/7_Export_Files/"
+        }
+    }
+    """
+    import json
+    import os
+
+    try:
+        # Support both direct invoke and API Gateway
+        if 'body' in event and event['body']:
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+        else:
+            body = event
+
+        sql_secret = body.get('sql_secret', os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production'))
+        database = body.get('database', 'Hacienda_ERP')
+        folder = body.get('folder', 'exports')
+        bucket = body.get('s3_bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
+
+        # Build output prefix with folder structure
+        output_prefix = f"{folder}/7_Export_Files/"
+
+        exporter = DeltaExporter(
+            bucket=bucket,
+            secret_name=sql_secret,
+            database_override=database,
+            output_prefix=output_prefix
+        )
+
+        result = exporter.export_all(update_status=True)
+
+        # Add output prefix to result for next step
+        result['output_prefix'] = output_prefix
+        result['s3_bucket'] = bucket
+
+        # For Step Functions, return result directly
+        if 'body' not in event:
+            return result
+
+        # For API Gateway
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps(result, default=str)
+        }
+
+    except Exception as e:
+        error_result = {
+            'status': 'error',
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+
+        if 'body' not in event:
+            return error_result
+
+        return {
+            'statusCode': 500,
+            'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+            'body': json.dumps(error_result)
+        }

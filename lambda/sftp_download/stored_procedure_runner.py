@@ -149,7 +149,7 @@ def clear_proc_trace(cursor):
 
 def execute_hcm_main_intf(
     test_execution: bool = True,
-    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
     database_override: str = None
 ) -> Dict:
     """
@@ -277,7 +277,7 @@ def execute_hcm_main_intf(
 
 
 def get_procedure_status(
-    secret_name: str = 'Hacienda_ERP_Test_MSSQL_text',
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
     database_override: str = None
 ) -> Dict:
     """

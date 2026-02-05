@@ -72,7 +72,7 @@ def run_stored_procedure_handler(event, context):
         # else: use default from secret ('Hacienda ERP Test')
 
         # Get secret name from environment or use default
-        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
+        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production')
 
         # Execute the stored procedure
         result = execute_hcm_main_intf(
@@ -144,7 +144,7 @@ def get_procedure_status_handler(event, context):
             database_override = 'Hacienda ERP'  # Production database
 
         # Get secret name from environment or use default
-        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_Test_MSSQL_text')
+        secret_name = os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production')
 
         # Get current status
         result = get_procedure_status(

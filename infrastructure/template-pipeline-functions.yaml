@@ -1,0 +1,91 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hacienda Pipeline Functions (Simple Deployment)
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+  S3BucketName:
+    Type: String
+    Default: hacienda-sftp-downloads
+  SubnetIds:
+    Type: CommaDelimitedList
+    Default: "subnet-08b10dbce706ef479"
+  SecurityGroupId:
+    Type: String
+    Default: sg-053f951a5563b6d5c
+  SqlSecretName:
+    Type: String
+    Default: Hacienda_ERP_MSSQL_Production
+
+Globals:
+  Function:
+    Timeout: 300
+    Runtime: python3.10
+    MemorySize: 512
+
+Resources:
+  # Lambda execution role with VPC access
+  LambdaVpcExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hacienda-pipeline-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SqlSecretName}*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Hacienda_ERP_MSSQL_Production*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Sterling_SFTP_Direct_Production*'
+
+  # Pipeline orchestrator function
+  PipelineOrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-pipeline-orchestrator-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.full_pipeline.pipeline_step_handler
+      Role: !GetAtt LambdaVpcExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - arn:aws:lambda:us-east-1:087243890715:layer:pymssql-python310:1
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          SQL_SECRET_NAME: !Ref SqlSecretName
+          SFTP_SECRET_NAME: Sterling_SFTP_Direct_Production
+
+Outputs:
+  PipelineOrchestratorFunctionArn:
+    Description: Pipeline Orchestrator function ARN
+    Value: !GetAtt PipelineOrchestratorFunction.Arn

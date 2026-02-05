@@ -1,0 +1,299 @@
+{
+  "Comment": "Hacienda HCM Full Pipeline - Orchestrates 60+ minute stored procedure execution with polling",
+  "StartAt": "SftpDownload",
+  "States": {
+    "SftpDownload": {
+      "Type": "Task",
+      "Resource": "${SftpDownloadFunctionArn}",
+      "Parameters": {
+        "action": "download",
+        "sftp_secret": "Sterling_SFTP_Direct_Production",
+        "remote_folder": "/GPR/HCM",
+        "s3_bucket.$": "$.s3_bucket"
+      },
+      "ResultPath": "$.sftpDownloadResult",
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "CreateTimestampedFolder"
+    },
+
+    "CreateTimestampedFolder": {
+      "Type": "Task",
+      "Resource": "${CreateFoldersFunctionArn}",
+      "Parameters": {
+        "action": "create_folders",
+        "s3_bucket.$": "$.s3_bucket",
+        "source_prefix": "downloads/"
+      },
+      "ResultPath": "$.folderResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "RunValidation"
+    },
+
+    "RunValidation": {
+      "Type": "Task",
+      "Resource": "${ValidationFunctionArn}",
+      "Parameters": {
+        "action": "full_validation",
+        "s3_bucket.$": "$.s3_bucket",
+        "folder.$": "$.folderResult.folder_name"
+      },
+      "ResultPath": "$.validationResult",
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "CheckValidationPassed"
+    },
+
+    "CheckValidationPassed": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.validationResult.has_critical_errors",
+          "BooleanEquals": true,
+          "Next": "GenerateValidationReport"
+        }
+      ],
+      "Default": "SqlLoad"
+    },
+
+    "GenerateValidationReport": {
+      "Type": "Task",
+      "Resource": "${ReportGeneratorFunctionArn}",
+      "Parameters": {
+        "report_type": "validation_error",
+        "s3_bucket.$": "$.s3_bucket",
+        "folder.$": "$.folderResult.folder_name",
+        "validation_result.$": "$.validationResult"
+      },
+      "ResultPath": "$.reportResult",
+      "Next": "PipelineFailedValidation"
+    },
+
+    "SqlLoad": {
+      "Type": "Task",
+      "Resource": "${SqlLoadFunctionArn}",
+      "Parameters": {
+        "action": "load_files",
+        "s3_bucket.$": "$.s3_bucket",
+        "folder.$": "$.folderResult.folder_name",
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        "database": "Hacienda_ERP"
+      },
+      "ResultPath": "$.sqlLoadResult",
+      "TimeoutSeconds": 840,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "StartStoredProcedure"
+    },
+
+    "StartStoredProcedure": {
+      "Type": "Task",
+      "Resource": "${ProcStarterFunctionArn}",
+      "Parameters": {
+        "action": "start_async",
+        "procedure": "HCM_MAIN_INTF",
+        "test_execution.$": "$.test_execution",
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        "database": "Hacienda_ERP"
+      },
+      "ResultPath": "$.procStartResult",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "WaitForProcedure"
+    },
+
+    "WaitForProcedure": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "CheckProcedureStatus"
+    },
+
+    "CheckProcedureStatus": {
+      "Type": "Task",
+      "Resource": "${ProcStatusFunctionArn}",
+      "Parameters": {
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        "database": "Hacienda_ERP"
+      },
+      "ResultPath": "$.procStatus",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.procStatusError",
+          "Next": "WaitForProcedure"
+        }
+      ],
+      "Next": "IsProcedureComplete"
+    },
+
+    "IsProcedureComplete": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.procStatus.is_completed",
+          "BooleanEquals": true,
+          "Next": "ExportDeltaFiles"
+        },
+        {
+          "Variable": "$.procStatus.status",
+          "StringEquals": "error",
+          "Next": "ProcedureFailed"
+        }
+      ],
+      "Default": "WaitForProcedure"
+    },
+
+    "ExportDeltaFiles": {
+      "Type": "Task",
+      "Resource": "${DeltaExportFunctionArn}",
+      "Parameters": {
+        "sql_secret": "Hacienda_ERP_MSSQL_Production",
+        "database": "Hacienda_ERP",
+        "folder.$": "$.folderResult.folder_name",
+        "s3_bucket.$": "$.s3_bucket"
+      },
+      "ResultPath": "$.exportResult",
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "SftpUpload"
+    },
+
+    "SftpUpload": {
+      "Type": "Task",
+      "Resource": "${SftpUploadFunctionArn}",
+      "Parameters": {
+        "sftp_secret": "Sterling_SFTP_Direct_Production",
+        "remote_folder": "/GPR/HCM/INPUT",
+        "export_folder.$": "$.exportResult.output_prefix",
+        "s3_bucket.$": "$.s3_bucket"
+      },
+      "ResultPath": "$.uploadResult",
+      "TimeoutSeconds": 600,
+      "Retry": [
+        {
+          "ErrorEquals": ["Lambda.ServiceException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "GenerateFinalReport"
+    },
+
+    "GenerateFinalReport": {
+      "Type": "Task",
+      "Resource": "${ReportGeneratorFunctionArn}",
+      "Parameters": {
+        "report_type": "pipeline_success",
+        "s3_bucket.$": "$.s3_bucket",
+        "folder.$": "$.folderResult.folder_name",
+        "sftp_download.$": "$.sftpDownloadResult",
+        "validation.$": "$.validationResult",
+        "sql_load.$": "$.sqlLoadResult",
+        "proc_status.$": "$.procStatus",
+        "export.$": "$.exportResult",
+        "upload.$": "$.uploadResult"
+      },
+      "ResultPath": "$.finalReport",
+      "Next": "PipelineSuccess"
+    },
+
+    "PipelineSuccess": {
+      "Type": "Succeed",
+      "Comment": "Pipeline completed successfully"
+    },
+
+    "ProcedureFailed": {
+      "Type": "Task",
+      "Resource": "${ReportGeneratorFunctionArn}",
+      "Parameters": {
+        "report_type": "procedure_error",
+        "s3_bucket.$": "$.s3_bucket",
+        "folder.$": "$.folderResult.folder_name",
+        "proc_status.$": "$.procStatus"
+      },
+      "ResultPath": "$.errorReport",
+      "Next": "PipelineFailed"
+    },
+
+    "PipelineFailedValidation": {
+      "Type": "Fail",
+      "Error": "ValidationError",
+      "Cause": "File validation failed - see report for details"
+    },
+
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "PipelineError",
+      "Cause": "Pipeline execution failed"
+    }
+  }
+}
