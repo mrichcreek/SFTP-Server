@@ -1,98 +1,54 @@
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
+# Build artifacts
+*.zip
+build.zip
+lambda-deploy.zip
+deployment.zip
+deployment_*.zip
 
-# Virtual environments
-venv/
-ENV/
-env/
-.venv/
+# Temporary files
+*.json
+!package.json
+!package-lock.json
+!tsconfig.json
+
+# Test outputs
+test_*.json
+*_response*.json
+sftp-*.json
+sql_response*.json
+
+# Build directories
+lambda-temp/
+lambda/package/
+lambda/deploy_pkg/
+lambda/layers/
+lambda/verify_zip/
+lambda/sftp_download_pkg/
+testfunction_code/
+frontend/build.zip
 
 # IDE
 .idea/
 .vscode/
 *.swp
 *.swo
-*~
 
-# OS
+# OS files
 .DS_Store
 Thumbs.db
+nul
 
-# Node.js
+# Node modules (already in frontend/.gitignore but just in case)
 node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
 
-# Amplify
-frontend/amplify/
-frontend/.amplify/
-amplify-backup/
-# Note: aws-exports.js is included in repo for Amplify deployment
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.Python
+env/
+venv/
 
-# Build outputs
-desktop_app/dist/
-desktop_app/build/
-*.spec
-
-# Environment files
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-
-# AWS SAM
-.aws-sam/
-samconfig.toml
-
-# Logs
-*.log
-logs/
-
-# Temporary files
-*.tmp
-*.temp
-temp/
-
-# Reference files (contain sensitive data patterns)
-RefrenceFiles/
-
-# Downloaded files list (generated)
-downloaded_files_list.txt
-
-# Certificates and credentials
-*.cer
-*.pem
-*.key
-*.p12
-*.pfx
-
-# Claude settings
-.claude/
-
-# Original SFTP scripts (may contain credentials)
-SFTP*.py
-
-# Desktop app logs and permissions
-desktop_app/download_log.txt
-desktop_app/docs/Permissions.json
+# Reference files (large Excel files)
+Reference Files/
+*.xlsx

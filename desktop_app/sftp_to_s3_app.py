@@ -69,7 +69,7 @@ AWS_REGION = "us-east-1"
 S3_BUCKET = "hacienda-sftp-downloads"
 
 # Application Settings
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.3.2"
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "download_log.txt")
 
 # Direct Lambda function URL for full-pipeline
@@ -955,6 +955,7 @@ class LocalDeltaExporter:
 
     def __init__(self):
         self.s3_client = boto3.client('s3', region_name=AWS_REGION)
+        self.secrets_client = None  # Will be set by HaciendaApp with authenticated credentials
         # Ensure local export folder exists
         os.makedirs(self.LOCAL_EXPORT_FOLDER, exist_ok=True)
 
@@ -1009,6 +1010,9 @@ class LocalDeltaExporter:
                 progress_callback("Getting database connection...")
 
             executor = LocalSqlExecutor()
+            # Use authenticated secrets client if available
+            if self.secrets_client:
+                executor.secrets_client = self.secrets_client
             conn_str = executor.get_connection_string()
             params = executor.parse_connection_string(conn_str)
 
@@ -1626,22 +1630,41 @@ class HaciendaApp:
 
     def init_s3_client(self):
         """Initialize S3 client using Cognito Identity credentials."""
+        self.refresh_aws_credentials()
+
+    def refresh_aws_credentials(self):
+        """Refresh AWS credentials from Cognito Identity Pool.
+
+        This should be called before any long-running operation that may
+        exceed the 1-hour credential expiration window.
+        """
         try:
-            # Use the authenticated session from Cognito Identity Pool
+            # Refresh the Cognito Identity credentials
+            self.auth._get_aws_credentials()
+
+            # Use the refreshed session
             session = self.auth.get_boto3_session()
             self.s3_client = session.client('s3', region_name=AWS_REGION)
             self.s3_client.head_bucket(Bucket=S3_BUCKET)
 
-            # Update the local executors to use the authenticated session
+            # Update the local executors to use the refreshed session
             self.local_downloader.s3_client = self.s3_client
             self.local_exporter.s3_client = self.s3_client
             self.local_sftp.s3_client = self.s3_client
 
-            # Update LocalSqlExecutor to use authenticated session for Secrets Manager
-            self.local_sql.secrets_client = session.client('secretsmanager', region_name=SQL_SECRET_REGION)
+            # Update LocalSqlExecutor and LocalDeltaExporter to use refreshed session for Secrets Manager
+            secrets_client = session.client('secretsmanager', region_name=SQL_SECRET_REGION)
+            self.local_sql.secrets_client = secrets_client
+            self.local_exporter.secrets_client = secrets_client
+
+            # Clear any cached connection strings so they get fetched with new credentials
+            self.local_sql.connection_string = None
+
+            print("AWS credentials refreshed successfully")
+            return True
         except Exception as e:
-            print(f"Error initializing S3 client: {e}")
-            self.s3_client = None
+            print(f"Error refreshing AWS credentials: {e}")
+            return False
 
     def do_logout(self):
         """Log out and return to login screen."""
@@ -2171,6 +2194,10 @@ class HaciendaApp:
                         self.root.after(0, lambda: self._update_step_status('stored_procedure', 'completed', f'{delta_count:,} records'))
                         self.root.after(0, lambda: self.update_progress_detailed(70, "Stored Procedure Complete", 7, total_steps,
                             f"Generated {delta_count:,} delta records"))
+
+                        # Refresh AWS credentials before delta export (stored procedure can take 60+ minutes)
+                        self.root.after(0, lambda: self.status_label.config(text="Refreshing AWS credentials..."))
+                        self.refresh_aws_credentials()
 
                         self.root.after(0, lambda: self._update_step_status('delta_export', 'running', 'Exporting...'))
                         self.root.after(0, lambda: self.update_progress_detailed(75, "Exporting Delta Files", 8, total_steps,

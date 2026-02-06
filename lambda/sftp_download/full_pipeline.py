@@ -190,6 +190,326 @@ class FullPipelineOrchestrator:
         pr_time = datetime.now(PR_TIMEZONE)
         return pr_time.strftime('%Y%m%d_%H%M')
 
+    def create_timestamped_folder(self, source_prefix: str = 'downloads/') -> Dict:
+        """
+        Create a timestamped folder and move files from source to it.
+        This is the public method called by Step Functions.
+
+        Args:
+            source_prefix: S3 prefix where source files are located (default: 'downloads/')
+
+        Returns:
+            Dict with folder_name, files_moved, success, and folder structure
+        """
+        try:
+            # Create timestamped folder name
+            folder_name = self._create_timestamped_folder()
+
+            # Create S3 folder structure
+            folders = self._create_s3_folders(folder_name)
+
+            # Copy files from source to initial files folder
+            initial_folder = folders['initial']
+            files_copied = self._copy_files_to_folder(source_prefix, initial_folder)
+
+            # Delete original files from downloads folder after successful copy
+            for file_info in files_copied:
+                source_key = file_info.get('source_key')
+                if source_key:
+                    try:
+                        self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
+                    except Exception:
+                        pass  # Continue even if delete fails
+
+            return {
+                'success': True,
+                'folder_name': folder_name,
+                'files_moved': len(files_copied),
+                'folders': folders,
+                'files': files_copied
+            }
+
+        except Exception as e:
+            import traceback
+            return {
+                'success': False,
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            }
+
+    def run_validation_steps(self, folder: str) -> Dict:
+        """
+        Run all validation steps for Step Functions.
+        Steps: duplicate check, name validation, schema validation, completeness check.
+
+        Args:
+            folder: Timestamped folder name (e.g., '20260206_1530')
+
+        Returns:
+            Dict with validation results
+        """
+        try:
+            folders = self._create_s3_folders(folder)
+            initial_folder = folders['initial']
+
+            # Get list of files to validate
+            files = self._list_initial_files(initial_folder)
+
+            if not files:
+                return {
+                    'all_passed': False,
+                    'has_critical_errors': True,
+                    'error': 'No CSV files found in initial folder',
+                    'valid_files': []
+                }
+
+            results = {
+                'all_passed': True,
+                'has_critical_errors': False,
+                'duplicate_check': {},
+                'name_validation': {},
+                'schema_validation': {},
+                'completeness_check': {},
+                'valid_files': [],
+                'invalid_files': []
+            }
+
+            # Step 1: Duplicate Check
+            try:
+                dup_result = detect_and_move_duplicates(
+                    self.bucket,
+                    initial_folder,
+                    folders['invalid']  # Move duplicates to invalid folder
+                )
+                results['duplicate_check'] = {
+                    'success': True,
+                    'duplicates_found': dup_result.get('duplicates_moved', 0),
+                    'files_remaining': dup_result.get('files_remaining', len(files))
+                }
+
+                # Re-list files after duplicate removal
+                files = self._list_initial_files(initial_folder)
+
+            except Exception as e:
+                results['duplicate_check'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+
+            # Step 2: Name Validation
+            try:
+                file_list = [f['filename'] for f in files]
+                name_result = validate_file_names(file_list)
+
+                invalid_names = [r for r in name_result if not r.get('valid', False)]
+                results['name_validation'] = {
+                    'success': len(invalid_names) == 0,
+                    'files_checked': len(file_list),
+                    'invalid_count': len(invalid_names),
+                    'invalid_files': invalid_names[:10]  # Limit for response size
+                }
+
+                if invalid_names:
+                    results['has_critical_errors'] = True
+                    results['all_passed'] = False
+
+            except Exception as e:
+                results['name_validation'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+
+            # Step 3: Schema Validation
+            try:
+                schema_result = validate_files_schema(
+                    self.bucket,
+                    [f['s3_key'] for f in files]
+                )
+
+                invalid_schema = [r for r in schema_result if not r.get('valid', False)]
+                results['schema_validation'] = {
+                    'success': len(invalid_schema) == 0,
+                    'files_checked': len(files),
+                    'invalid_count': len(invalid_schema),
+                    'invalid_files': invalid_schema[:10]
+                }
+
+                # Move invalid schema files
+                for invalid in invalid_schema:
+                    source_key = invalid.get('s3_key')
+                    if source_key:
+                        filename = source_key.split('/')[-1]
+                        dest_key = f"{folders['invalid_schema']}{filename}"
+                        try:
+                            self.s3_client.copy_object(
+                                Bucket=self.bucket,
+                                CopySource={'Bucket': self.bucket, 'Key': source_key},
+                                Key=dest_key
+                            )
+                            self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
+                            results['invalid_files'].append({
+                                'filename': filename,
+                                'reason': 'schema_invalid',
+                                'errors': invalid.get('errors', [])
+                            })
+                        except Exception:
+                            pass
+
+                if invalid_schema:
+                    results['all_passed'] = False
+                    # Schema errors are critical only if all files fail
+                    if len(invalid_schema) == len(files):
+                        results['has_critical_errors'] = True
+
+            except Exception as e:
+                results['schema_validation'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+
+            # Step 4: Completeness Check
+            try:
+                # Re-list files after schema validation
+                files = self._list_initial_files(initial_folder)
+                file_list = [f['filename'] for f in files]
+
+                completeness = check_file_completeness(file_list)
+
+                results['completeness_check'] = {
+                    'success': completeness.get('complete', False),
+                    'entities_complete': completeness.get('entities_complete', []),
+                    'entities_incomplete': completeness.get('entities_incomplete', []),
+                    'missing_files': completeness.get('missing_files', [])[:20]  # Limit
+                }
+
+                # Completeness issues are warnings, not critical errors
+                if not completeness.get('complete', False):
+                    results['all_passed'] = False
+
+            except Exception as e:
+                results['completeness_check'] = {
+                    'success': False,
+                    'error': str(e)
+                }
+
+            # Final list of valid files
+            files = self._list_initial_files(initial_folder)
+            results['valid_files'] = [f['s3_key'] for f in files]
+
+            return results
+
+        except Exception as e:
+            import traceback
+            return {
+                'all_passed': False,
+                'has_critical_errors': True,
+                'error': str(e),
+                'traceback': traceback.format_exc(),
+                'valid_files': []
+            }
+
+    def load_files_to_sql(self, folder: str, database: str = 'Hacienda_ERP') -> Dict:
+        """
+        Load validated files to SQL Server.
+
+        Args:
+            folder: Timestamped folder name (e.g., '20260206_1530')
+            database: Target database name
+
+        Returns:
+            Dict with load results
+        """
+        try:
+            folders = self._create_s3_folders(folder)
+            initial_folder = folders['initial']
+
+            # Get list of files to load
+            files = self._list_initial_files(initial_folder)
+
+            if not files:
+                return {
+                    'success': False,
+                    'error': 'No files to load',
+                    'tables_created': 0,
+                    'rows_loaded': 0
+                }
+
+            # Create SQL loader
+            loader = SqlServerLoader(
+                bucket=self.bucket,
+                secret_name=self.secret_name
+            )
+
+            # Load each file
+            load_results = []
+            total_rows = 0
+            tables_created = 0
+
+            for file_info in files:
+                s3_key = file_info['s3_key']
+                filename = file_info['filename']
+
+                try:
+                    result = loader.load_file(
+                        s3_key=s3_key,
+                        database=database,
+                        drop_existing=True
+                    )
+
+                    load_results.append({
+                        'filename': filename,
+                        'success': result.get('success', False),
+                        'table_name': result.get('table_name'),
+                        'rows_loaded': result.get('rows_loaded', 0)
+                    })
+
+                    if result.get('success'):
+                        tables_created += 1
+                        total_rows += result.get('rows_loaded', 0)
+
+                except Exception as e:
+                    load_results.append({
+                        'filename': filename,
+                        'success': False,
+                        'error': str(e)
+                    })
+
+            # Generate load report
+            report_content = json.dumps({
+                'timestamp': datetime.now().isoformat(),
+                'folder': folder,
+                'database': database,
+                'tables_created': tables_created,
+                'total_rows': total_rows,
+                'files': load_results
+            }, indent=2)
+
+            report_key = self._upload_report(
+                folders['load'],
+                f"sql_load_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                report_content
+            )
+
+            return {
+                'success': tables_created > 0,
+                'tables_created': tables_created,
+                'total_rows': total_rows,
+                'files_processed': len(files),
+                'files_loaded': tables_created,
+                'load_results': load_results[:20],  # Limit response size
+                'report_key': report_key
+            }
+
+        except Exception as e:
+            import traceback
+            return {
+                'success': False,
+                'error': str(e),
+                'traceback': traceback.format_exc(),
+                'tables_created': 0,
+                'rows_loaded': 0
+            }
+
     def _get_folder_path(self, base_folder: str, subfolder: str) -> str:
         """Get the full S3 prefix for a subfolder."""
         return f"{base_folder}/{self.FOLDERS.get(subfolder, subfolder)}/"
@@ -1956,7 +2276,7 @@ def pipeline_step_handler(event, context):
                 tests['httpbin_ip'] = f'Error: {e}'
 
             # Test Sterling SFTP port
-            sftp_host = event.get('sftp_host', '64.185.194.10')
+            sftp_host = event.get('sftp_host', '64.185.194.33')
             sftp_port = event.get('sftp_port', 22)
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2038,8 +2358,132 @@ def pipeline_step_handler(event, context):
             load_result = orchestrator.load_files_to_sql(folder, database)
             result.update(load_result)
 
+        elif action == 'start_procedure':
+            # Start the stored procedure asynchronously
+            sql_secret = event.get('sql_secret', 'Hacienda_ERP_MSSQL_Production')
+            database = event.get('database', 'Hacienda_ERP')
+            procedure = event.get('procedure', 'HCM_MAIN_INTF')
+            test_execution = event.get('test_execution', False)
+
+            try:
+                # Import stored procedure runner
+                try:
+                    from .stored_procedure_runner import start_procedure_async, clear_run_status
+                except ImportError:
+                    from sftp_download.stored_procedure_runner import start_procedure_async, clear_run_status
+
+                # Clear any stuck run status
+                clear_run_status(sql_secret, database)
+
+                # Start procedure
+                proc_result = start_procedure_async(
+                    secret_name=sql_secret,
+                    database=database,
+                    procedure=procedure,
+                    test_mode=test_execution
+                )
+
+                result['procedure_started'] = True
+                result['procedure'] = procedure
+                result['test_execution'] = test_execution
+                result['success'] = True
+                result.update(proc_result)
+
+            except Exception as e:
+                result['error'] = str(e)
+                result['success'] = False
+                result['procedure_started'] = False
+
+        elif action == 'check_procedure_status':
+            # Check stored procedure completion status
+            sql_secret = event.get('sql_secret', 'Hacienda_ERP_MSSQL_Production')
+            database = event.get('database', 'Hacienda_ERP')
+
+            try:
+                # Import stored procedure runner
+                try:
+                    from .stored_procedure_runner import check_procedure_status
+                except ImportError:
+                    from sftp_download.stored_procedure_runner import check_procedure_status
+
+                status_result = check_procedure_status(
+                    secret_name=sql_secret,
+                    database=database
+                )
+
+                result['is_completed'] = status_result.get('is_completed', False)
+                result['status'] = status_result.get('status', 'unknown')
+                result['current_step'] = status_result.get('current_step')
+                result['steps_completed'] = status_result.get('steps_completed', [])
+                result['delta_counts'] = status_result.get('delta_counts', {})
+                result['success'] = True
+
+            except Exception as e:
+                result['error'] = str(e)
+                result['success'] = False
+                result['is_completed'] = False
+                result['status'] = 'error'
+
+        elif action == 'export_delta':
+            # Export delta files from SQL Server to S3
+            sql_secret = event.get('sql_secret', 'Hacienda_ERP_MSSQL_Production')
+            database = event.get('database', 'Hacienda_ERP')
+            folder = event.get('folder')
+
+            try:
+                # Import delta exporter
+                try:
+                    from .delta_exporter import DeltaExporter
+                except ImportError:
+                    from sftp_download.delta_exporter import DeltaExporter
+
+                # Set output prefix to folder's delta directory if provided
+                output_prefix = f"{folder}/6_Delta_Files/" if folder else 'exports/'
+
+                exporter = DeltaExporter(
+                    bucket=bucket,
+                    secret_name=sql_secret,
+                    database_override=database,
+                    output_prefix=output_prefix
+                )
+
+                # Export delta files
+                export_result = exporter.export_all(update_status=True)
+
+                result.update(export_result)
+                result['folder'] = folder
+                result['success'] = export_result.get('success', False)
+
+            except Exception as e:
+                import traceback
+                result['error'] = str(e)
+                result['traceback'] = traceback.format_exc()
+                result['success'] = False
+
+        elif action == 'generate_report':
+            # Generate report (validation error, procedure error, or success)
+            report_type = event.get('report_type', 'unknown')
+            folder = event.get('folder')
+
+            result['report_type'] = report_type
+            result['folder'] = folder
+            result['success'] = True
+            result['message'] = f"Report type: {report_type}"
+
+            # Include relevant data based on report type
+            if report_type == 'validation_error':
+                result['validation_result'] = event.get('validation_result', {})
+            elif report_type == 'procedure_error':
+                result['proc_status'] = event.get('proc_status', {})
+            elif report_type == 'pipeline_success':
+                result['sftp_download'] = event.get('sftp_download', {})
+                result['validation'] = event.get('validation', {})
+                result['sql_load'] = event.get('sql_load', {})
+                result['proc_status'] = event.get('proc_status', {})
+                result['export'] = event.get('export', {})
+
         elif action in ['validation_error', 'procedure_error', 'pipeline_success']:
-            # Generate report - just acknowledge, report is in the state
+            # Legacy report action handling
             result['report_type'] = action
             result['success'] = True
             result['message'] = f"Report type: {action}"
@@ -2104,3 +2548,364 @@ def get_pipeline_folders_handler(event, context):
             },
             'body': json.dumps({'error': str(e)})
         }
+
+
+# ============================================================================
+# Step Functions API Handlers
+# ============================================================================
+
+STATE_MACHINE_ARN = os.environ.get(
+    'STATE_MACHINE_ARN',
+    'arn:aws:states:us-east-1:087243890715:stateMachine:hacienda-hcm-pipeline-prod'
+)
+
+
+def start_pipeline_handler(event, context):
+    """
+    API Gateway handler to start the Step Functions pipeline.
+
+    POST /start-pipeline
+    Body: {
+        "test_execution": true/false,
+        "s3_bucket": "hacienda-sftp-downloads"
+    }
+    """
+    try:
+        # Parse request body
+        body = {}
+        if event.get('body'):
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+
+        # Build Step Functions input
+        sf_input = {
+            's3_bucket': body.get('s3_bucket', 'hacienda-sftp-downloads'),
+            'test_execution': body.get('test_execution', False)
+        }
+
+        # Start execution
+        sfn_client = boto3.client('stepfunctions')
+
+        # Generate execution name with timestamp
+        execution_name = f"pipeline-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+
+        response = sfn_client.start_execution(
+            stateMachineArn=STATE_MACHINE_ARN,
+            name=execution_name,
+            input=json.dumps(sf_input)
+        )
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            },
+            'body': json.dumps({
+                'success': True,
+                'execution_id': response['executionArn'],
+                'execution_name': execution_name,
+                'started_at': response['startDate'].isoformat()
+            })
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'success': False,
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+        }
+
+
+def get_pipeline_status_handler(event, context):
+    """
+    API Gateway handler to get Step Functions execution status.
+
+    GET /pipeline-status/{executionId}
+    """
+    try:
+        # Get execution ID from path parameters
+        execution_id = None
+        if event.get('pathParameters'):
+            execution_id = event['pathParameters'].get('executionId')
+
+        if not execution_id:
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'error': 'executionId required'})
+            }
+
+        # URL decode if needed
+        import urllib.parse
+        execution_id = urllib.parse.unquote(execution_id)
+
+        sfn_client = boto3.client('stepfunctions')
+
+        # Get execution details
+        execution = sfn_client.describe_execution(executionArn=execution_id)
+
+        # Get execution history to determine current step
+        history = sfn_client.get_execution_history(
+            executionArn=execution_id,
+            maxResults=100,
+            reverseOrder=True
+        )
+
+        # Parse current state and step details
+        current_step = None
+        completed_steps = []
+        step_details = {}
+
+        for event_item in reversed(history['events']):
+            event_type = event_item['type']
+
+            if event_type == 'TaskStateEntered':
+                state_name = event_item.get('stateEnteredEventDetails', {}).get('name')
+                if state_name:
+                    current_step = state_name
+
+            elif event_type == 'TaskStateExited':
+                state_name = event_item.get('stateExitedEventDetails', {}).get('name')
+                output = event_item.get('stateExitedEventDetails', {}).get('output')
+                if state_name and state_name not in completed_steps:
+                    completed_steps.append(state_name)
+                    if output:
+                        try:
+                            step_details[state_name] = json.loads(output)
+                        except:
+                            step_details[state_name] = {'raw': output[:500]}
+
+            elif event_type == 'ExecutionFailed':
+                error = event_item.get('executionFailedEventDetails', {})
+                step_details['error'] = error
+
+        # Build response
+        result = {
+            'execution_id': execution_id,
+            'status': execution['status'],
+            'current_step': current_step,
+            'completed_steps': completed_steps,
+            'step_details': step_details,
+            'started_at': execution['startDate'].isoformat() if execution.get('startDate') else None,
+            'stopped_at': execution.get('stopDate').isoformat() if execution.get('stopDate') else None
+        }
+
+        # Include output if execution completed
+        if execution['status'] in ['SUCCEEDED', 'FAILED', 'ABORTED']:
+            if execution.get('output'):
+                try:
+                    result['output'] = json.loads(execution['output'])
+                except:
+                    result['output'] = execution['output']
+            if execution.get('error'):
+                result['error'] = execution.get('error')
+            if execution.get('cause'):
+                result['cause'] = execution.get('cause')
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'GET,OPTIONS'
+            },
+            'body': json.dumps(result)
+        }
+
+    except sfn_client.exceptions.ExecutionDoesNotExist:
+        return {
+            'statusCode': 404,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({'error': 'Execution not found'})
+        }
+    except Exception as e:
+        import traceback
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+        }
+
+
+def list_pipeline_executions_handler(event, context):
+    """
+    API Gateway handler to list recent Step Functions executions.
+
+    GET /pipeline-executions?max_results=10
+    """
+    try:
+        # Get max_results from query parameters
+        max_results = 10
+        if event.get('queryStringParameters'):
+            max_results = int(event['queryStringParameters'].get('max_results', 10))
+
+        sfn_client = boto3.client('stepfunctions')
+
+        # List executions
+        response = sfn_client.list_executions(
+            stateMachineArn=STATE_MACHINE_ARN,
+            maxResults=min(max_results, 100)
+        )
+
+        executions = []
+        for execution in response['executions']:
+            executions.append({
+                'execution_id': execution['executionArn'],
+                'name': execution['name'],
+                'status': execution['status'],
+                'started_at': execution['startDate'].isoformat(),
+                'stopped_at': execution.get('stopDate').isoformat() if execution.get('stopDate') else None
+            })
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'GET,OPTIONS'
+            },
+            'body': json.dumps({
+                'executions': executions,
+                'count': len(executions)
+            })
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+        }
+
+
+def stop_pipeline_handler(event, context):
+    """
+    API Gateway handler to stop a running Step Functions execution.
+
+    POST /stop-pipeline
+    Body: { "execution_id": "arn:aws:states:..." }
+    """
+    try:
+        body = {}
+        if event.get('body'):
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+
+        execution_id = body.get('execution_id')
+        if not execution_id:
+            return {
+                'statusCode': 400,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'error': 'execution_id required'})
+            }
+
+        sfn_client = boto3.client('stepfunctions')
+
+        sfn_client.stop_execution(
+            executionArn=execution_id,
+            cause='Stopped by user'
+        )
+
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'POST,OPTIONS'
+            },
+            'body': json.dumps({
+                'success': True,
+                'message': 'Execution stopped',
+                'execution_id': execution_id
+            })
+        }
+
+    except Exception as e:
+        import traceback
+        return {
+            'statusCode': 500,
+            'headers': {
+                'Content-Type': 'application/json',
+                'Access-Control-Allow-Origin': '*'
+            },
+            'body': json.dumps({
+                'error': str(e),
+                'traceback': traceback.format_exc()
+            })
+        }
+
+
+# ============================================================================
+# Unified API Gateway Router
+# ============================================================================
+
+def api_router_handler(event, context):
+    """
+    Unified API Gateway handler that routes requests to the appropriate handler
+    based on the request path.
+
+    This is the main entry point for API Gateway requests.
+    """
+    path = event.get('path', '')
+    http_method = event.get('httpMethod', 'GET')
+
+    # Handle CORS preflight
+    if http_method == 'OPTIONS':
+        return {
+            'statusCode': 200,
+            'headers': {
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS'
+            },
+            'body': ''
+        }
+
+    # Route based on path
+    if path == '/start-pipeline':
+        return start_pipeline_handler(event, context)
+    elif path.startswith('/pipeline-status/'):
+        return get_pipeline_status_handler(event, context)
+    elif path == '/pipeline-executions':
+        return list_pipeline_executions_handler(event, context)
+    elif path == '/stop-pipeline':
+        return stop_pipeline_handler(event, context)
+    elif path == '/pipeline-folders':
+        return get_pipeline_folders_handler(event, context)
+    else:
+        # Fall back to the step handler for Step Functions calls
+        return pipeline_step_handler(event, context)

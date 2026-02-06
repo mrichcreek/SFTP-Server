@@ -45,7 +45,7 @@ Parameters:
 Globals:
   Function:
     Timeout: 900
-    Runtime: python3.11
+    Runtime: python3.10
     MemorySize: 512
 
 Resources:
@@ -172,6 +172,8 @@ Resources:
                   - s3:PutObject
                   - s3:GetObject
                   - s3:ListBucket
+                  - s3:CopyObject
+                  - s3:DeleteObject
                 Resource:
                   - !GetAtt DownloadsBucket.Arn
                   - !Sub '${DownloadsBucket.Arn}/*'
@@ -182,7 +184,10 @@ Resources:
               - Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Hacienda_ERP_Test_MSSQL_text*'
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Hacienda_ERP_MSSQL_Production*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Sterling_SFTP_Direct_Production*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:Hacienda_ERP_Test_MSSQL_text*'
               - Effect: Allow
                 Action:
                   - dynamodb:PutItem
@@ -194,6 +199,14 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                  - states:StopExecution
+                  - states:DescribeExecution
+                  - states:GetExecutionHistory
+                  - states:ListExecutions
                 Resource: '*'
 
   # Lambda function for SFTP download
@@ -441,7 +454,7 @@ Resources:
         Variables:
           S3_BUCKET: !Ref DownloadsBucket
           JOBS_TABLE: !Ref DownloadJobsTable
-          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
       Events:
         RunIntegratedWorkflow:
           Type: Api
@@ -494,7 +507,7 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DownloadsBucket
-          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
       Events:
         LoadToSql:
           Type: Api
@@ -527,7 +540,7 @@ Resources:
         Variables:
           S3_BUCKET: !Ref DownloadsBucket
           JOBS_TABLE: !Ref DownloadJobsTable
-          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
           SFTP_HOST: !Ref SftpHost
           SFTP_PORT: !Ref SftpPort
       Events:
@@ -583,7 +596,7 @@ Resources:
       Environment:
         Variables:
           S3_BUCKET: !Ref DownloadsBucket
-          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
       Events:
         RunProcedure:
           Type: Api
@@ -609,7 +622,7 @@ Resources:
         SubnetIds: !Ref SubnetIds
       Environment:
         Variables:
-          SQL_SECRET_NAME: Hacienda_ERP_Test_MSSQL_text
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
       Events:
         GetProcedureStatus:
           Type: Api
@@ -619,6 +632,191 @@ Resources:
             Method: GET
             Auth:
               Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # Step Functions State Machine for Full Pipeline
+  # ============================================================================
+
+  # IAM Role for Step Functions
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'hacienda-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt SftpDownloadFunction.Arn
+                  - !GetAtt ValidateFilesFunction.Arn
+                  - !GetAtt SqlLoadFunction.Arn
+                  - !GetAtt RunProcedureFunction.Arn
+                  - !GetAtt ProcedureStatusFunction.Arn
+                  - !GetAtt FullPipelineFunction.Arn
+                  - !GetAtt ProcStarterFunction.Arn
+                  - !GetAtt DeltaExportFunction.Arn
+                  - !GetAtt SftpUploadFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Step Functions State Machine
+  HaciendaPipelineStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'hacienda-full-pipeline-${Environment}'
+      DefinitionUri: ./statemachine/pipeline.asl.json
+      DefinitionSubstitutions:
+        SftpDownloadFunctionArn: !GetAtt SftpDownloadFunction.Arn
+        CreateFoldersFunctionArn: !GetAtt FullPipelineFunction.Arn
+        ValidationFunctionArn: !GetAtt ValidateFilesFunction.Arn
+        SqlLoadFunctionArn: !GetAtt SqlLoadFunction.Arn
+        ProcStarterFunctionArn: !GetAtt ProcStarterFunction.Arn
+        ProcStatusFunctionArn: !GetAtt ProcedureStatusFunction.Arn
+        DeltaExportFunctionArn: !GetAtt DeltaExportFunction.Arn
+        SftpUploadFunctionArn: !GetAtt SftpUploadFunction.Arn
+        ReportGeneratorFunctionArn: !GetAtt FullPipelineFunction.Arn
+      Role: !GetAtt StepFunctionsExecutionRole.Arn
+      Tracing:
+        Enabled: true
+
+  # Lambda for starting stored procedure asynchronously
+  ProcStarterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-proc-starter-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.proc_starter_handler.start_procedure_async
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
+          S3_BUCKET: !Ref DownloadsBucket
+
+  # Lambda for delta file export
+  DeltaExportFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-delta-export-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.delta_exporter.export_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          SQL_SECRET_NAME: Hacienda_ERP_MSSQL_Production
+
+  # Lambda for SFTP upload
+  SftpUploadFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-sftp-upload-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.sftp_uploader.upload_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+        SubnetIds: !Ref SubnetIds
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+          SFTP_SECRET_NAME: Sterling_SFTP_Direct_Production
+
+  # API endpoint for starting Step Functions execution
+  StartPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-start-pipeline-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.pipeline_api_handler.start_pipeline_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref HaciendaPipelineStateMachine
+          JOBS_TABLE: !Ref DownloadJobsTable
+          S3_BUCKET: !Ref DownloadsBucket
+      Events:
+        StartPipeline:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /start-pipeline
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # API endpoint for getting pipeline status
+  PipelineStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-pipeline-status-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.pipeline_api_handler.get_pipeline_status_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref HaciendaPipelineStateMachine
+          JOBS_TABLE: !Ref DownloadJobsTable
+      Events:
+        GetPipelineStatus:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /pipeline-status/{executionId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ============================================================================
+  # VPC Endpoint for S3
+  # ============================================================================
+  # NOTE: Lambda functions in a VPC need an S3 VPC Endpoint to access S3.
+  # If your VPC already has an S3 VPC Endpoint configured, no action is needed.
+  #
+  # If you get S3 authorization errors like:
+  #   "Authorization header requires 'Credential' parameter"
+  # You need to create an S3 VPC Gateway Endpoint in your VPC:
+  #
+  # 1. Go to AWS Console > VPC > Endpoints
+  # 2. Create Endpoint:
+  #    - Service: com.amazonaws.us-east-1.s3 (Gateway type)
+  #    - VPC: Select your VPC
+  #    - Route Tables: Select the route table(s) for your private subnets
+  # 3. The Lambda will then be able to access S3 through the VPC endpoint
+  # ============================================================================
 
   # API Gateway
   ApiGateway:
@@ -664,3 +862,15 @@ Outputs:
   WorkflowFunctionArn:
     Description: Workflow orchestration Lambda function ARN
     Value: !GetAtt WorkflowFunction.Arn
+
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref HaciendaPipelineStateMachine
+
+  StartPipelineFunctionArn:
+    Description: Start Pipeline API function ARN
+    Value: !GetAtt StartPipelineFunction.Arn
+
+  PipelineStatusFunctionArn:
+    Description: Pipeline Status API function ARN
+    Value: !GetAtt PipelineStatusFunction.Arn

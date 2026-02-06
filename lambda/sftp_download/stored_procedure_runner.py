@@ -147,6 +147,148 @@ def clear_proc_trace(cursor):
         pass  # Table might not exist
 
 
+def clear_run_status(
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
+    database: str = 'Hacienda_ERP'
+):
+    """
+    Clear any stuck RUN_INTF_STATUS before starting a new run.
+    Sets status to '00-Ready' if currently in error or running state.
+    """
+    import pymssql
+
+    try:
+        connection_string = get_aws_secret(secret_name)
+        conn_params = parse_connection_string(connection_string)
+        conn_params['database'] = database
+
+        with pymssql.connect(
+            server=conn_params['server'],
+            port=conn_params.get('port', 1433),
+            user=conn_params['user'],
+            password=conn_params['password'],
+            database=conn_params['database'],
+            tds_version='7.3',
+            autocommit=True
+        ) as conn:
+            cursor = conn.cursor()
+
+            # Check current status
+            cursor.execute("SELECT TOP 1 RunStatus FROM dbo.RUN_INTF_STATUS ORDER BY RunID DESC")
+            row = cursor.fetchone()
+
+            if row:
+                current_status = row[0] or ''
+                # Clear if stuck in running or error state
+                if current_status not in ['00-Ready', '02-Completed']:
+                    cursor.execute("""
+                        UPDATE dbo.RUN_INTF_STATUS
+                        SET RunStatus = '00-Ready',
+                            LastUpdate = GETDATE()
+                        WHERE RunID = (SELECT MAX(RunID) FROM dbo.RUN_INTF_STATUS)
+                    """)
+
+            # Also clear ProcTrace
+            clear_proc_trace(cursor)
+
+    except Exception as e:
+        # Don't fail if we can't clear - the procedure might still work
+        print(f"Warning: Could not clear run status: {e}")
+
+
+def start_procedure_async(
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
+    database: str = 'Hacienda_ERP',
+    procedure: str = 'HCM_MAIN_INTF',
+    test_mode: bool = False
+) -> Dict:
+    """
+    Start the stored procedure asynchronously (fire and forget).
+    This is used by Step Functions - it starts the procedure but doesn't wait.
+
+    Args:
+        secret_name: AWS Secrets Manager secret
+        database: Target database
+        procedure: Procedure name to execute
+        test_mode: Whether to run in test mode
+
+    Returns:
+        Dict with started status
+    """
+    import pymssql
+
+    test_flag = 'Y' if test_mode else 'N'
+
+    try:
+        connection_string = get_aws_secret(secret_name)
+        conn_params = parse_connection_string(connection_string)
+        conn_params['database'] = database
+
+        with pymssql.connect(
+            server=conn_params['server'],
+            port=conn_params.get('port', 1433),
+            user=conn_params['user'],
+            password=conn_params['password'],
+            database=conn_params['database'],
+            tds_version='7.3',
+            autocommit=True,
+            timeout=60  # Short timeout - just need to start
+        ) as conn:
+            cursor = conn.cursor()
+
+            # Clear ProcTrace before starting
+            clear_proc_trace(cursor)
+
+            # Start the procedure (this will begin execution)
+            cursor.execute(f"EXEC dbo.{procedure} @TestExecution = %s", (test_flag,))
+
+            return {
+                'started': True,
+                'procedure': procedure,
+                'test_mode': test_mode,
+                'database': database,
+                'started_at': datetime.now().isoformat()
+            }
+
+    except Exception as e:
+        return {
+            'started': False,
+            'error': str(e),
+            'procedure': procedure
+        }
+
+
+def check_procedure_status(
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
+    database: str = 'Hacienda_ERP'
+) -> Dict:
+    """
+    Check the status of a running stored procedure.
+    This is a wrapper for get_procedure_status with the expected output format.
+
+    Returns:
+        Dict with is_completed, status, current_step, steps_completed, delta_counts
+    """
+    result = get_procedure_status(secret_name, database)
+
+    run_status = result.get('run_status', {}) or {}
+    status_code = run_status.get('run_status', '') or ''
+
+    # Determine if completed
+    is_completed = status_code == '02-Completed'
+    is_error = 'error' in status_code.lower() or 'fail' in status_code.lower()
+
+    return {
+        'is_completed': is_completed,
+        'status': 'error' if is_error else ('completed' if is_completed else 'running'),
+        'current_step': run_status.get('current_step'),
+        'run_status_raw': status_code,
+        'steps_completed': result.get('steps_completed', []),
+        'delta_counts': result.get('delta_counts', {}),
+        'database': database
+    }
+
+
 def execute_hcm_main_intf(
     test_execution: bool = True,
     secret_name: str = 'Hacienda_ERP_MSSQL_Production',
