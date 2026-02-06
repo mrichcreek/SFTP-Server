@@ -240,7 +240,7 @@ def start_procedure_async(
             clear_proc_trace(cursor)
 
             # Start the procedure (this will begin execution)
-            cursor.execute(f"EXEC dbo.{procedure} @TestExecution = %s", (test_flag,))
+            cursor.execute(f"EXEC dbo.{procedure} @test_execution = %s", (test_flag,))
 
             return {
                 'started': True,
