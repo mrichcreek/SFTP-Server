@@ -86,6 +86,15 @@ const formatDuration = (seconds) => {
   return `${secs}s`;
 };
 
+// Format bytes to human readable
+const formatBytes = (bytes) => {
+  if (!bytes) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+};
+
 // Format date/time
 const formatDateTime = (date) => {
   if (!date) return '--';
@@ -429,6 +438,7 @@ function PipelineInterface() {
   const pollingRef = useRef(null);
   const executionIdRef = useRef(null);
   const startTimeRef = useRef(null);
+  const stepDataRef = useRef({});  // Persist step data across polls
 
   // Load history
   useEffect(() => {
@@ -465,7 +475,8 @@ function PipelineInterface() {
   };
 
   const toggleSubTask = (stepId, subTaskId) => {
-    setStepData(prev => ({
+    // Update both the state and the ref to persist across polls
+    const updateFn = (prev) => ({
       ...prev,
       [stepId]: {
         ...prev[stepId],
@@ -477,7 +488,12 @@ function PipelineInterface() {
           }
         }
       }
-    }));
+    });
+    setStepData(prev => {
+      const newData = updateFn(prev);
+      stepDataRef.current = newData;  // Keep ref in sync
+      return newData;
+    });
   };
 
   const mapStateToStepId = (stateName) => {
@@ -499,13 +515,17 @@ function PipelineInterface() {
   };
 
   const pollStatus = useCallback(async () => {
-    // Use ref to get the current execution ID (avoids stale closure issue)
     const currentExecutionId = executionIdRef.current;
     if (!currentExecutionId) return;
+
     try {
       const status = await getPipelineStatus(currentExecutionId);
-      // API returns current_step and completed_steps (not current_state/completed_states)
       const currentStepId = mapStateToStepId(status.current_step);
+
+      // Get the step_details which contains all the detailed results
+      const stepDetails = status.step_details || {};
+      // The data is nested under the current step key (e.g., CheckProcedureStatus)
+      const detailsData = stepDetails[status.current_step] || stepDetails[Object.keys(stepDetails)[0]] || {};
 
       setProcessInfo({
         id: currentExecutionId.split(':').pop()?.slice(0, 15),
@@ -514,32 +534,208 @@ function PipelineInterface() {
         status: status.status
       });
 
-      const newStepData = { ...stepData };
-      // API returns completed_steps array
-      if (status.completed_steps) {
-        status.completed_steps.forEach(state => {
-          const stepId = mapStateToStepId(state);
-          if (stepId && !newStepData[stepId]) {
-            newStepData[stepId] = { status: 'pass', duration: 0 };
+      // Build step data from the API response details
+      // Preserve existing data to keep user interactions (like isExpanded)
+      const prevData = stepDataRef.current;
+      const newStepData = { ...prevData };
+
+      // Helper to preserve isExpanded state from previous data
+      const getExpandedState = (stepId, subTaskId) => {
+        return prevData[stepId]?.subTasks?.[subTaskId]?.isExpanded || false;
+      };
+
+      // Extract SFTP Download results
+      const sftpResult = detailsData.sftpDownloadResult;
+      if (sftpResult) {
+        const downloadDuration = sftpResult.completed_at && sftpResult.started_at
+          ? Math.round((new Date(sftpResult.completed_at) - new Date(sftpResult.started_at)) / 1000)
+          : 0;
+
+        newStepData.sftp_download = {
+          status: sftpResult.success ? 'pass' : 'fail',
+          duration: downloadDuration,
+          subTasks: {
+            connect: {
+              status: sftpResult.connected ? 'pass' : (sftpResult.success ? 'pass' : 'fail'),
+              duration: 2
+            },
+            discover: {
+              status: sftpResult.total_files > 0 ? 'pass' : 'pending',
+              count: sftpResult.total_files || sftpResult.files_downloaded || 0,
+              files: (sftpResult.file_results || []).map(f => ({
+                name: f.filename,
+                size: formatBytes(f.source_size),
+                status: f.success ? 'completed' : 'failed'
+              })),
+              isExpanded: getExpandedState('sftp_download', 'discover')
+            },
+            download: {
+              status: sftpResult.files_downloaded > 0 ? 'pass' : 'pending',
+              count: sftpResult.files_downloaded || 0,
+              progress: sftpResult.files_downloaded > 0 ? 100 : 0,
+              totalBytes: sftpResult.total_bytes || 0,
+              files: (sftpResult.file_results || []).filter(f => f.success).map(f => ({
+                name: f.filename,
+                size: formatBytes(f.uploaded_size),
+                status: 'completed'
+              })),
+              isExpanded: getExpandedState('sftp_download', 'download')
+            }
           }
-        });
+        };
       }
 
+      // Extract Folder creation results (part of step 1 - Download)
+      const folderResult = detailsData.folderResult;
+      if (folderResult && folderResult.success) {
+        // Keep sftp_download as pass if folder creation succeeded
+        if (newStepData.sftp_download) {
+          newStepData.sftp_download.folderName = folderResult.folder_name;
+          newStepData.sftp_download.filesMoved = folderResult.files_moved;
+        }
+      }
+
+      // Extract Validation results
+      const validationResult = detailsData.validationResult;
+      if (validationResult) {
+        // Count valid files for display
+        const validFileCount = validationResult.valid_files?.length || 0;
+
+        newStepData.validation = {
+          status: validationResult.validation_passed ? 'pass' : (validationResult.has_critical_errors ? 'fail' : 'pass'),
+          duration: 0,
+          subTasks: {
+            duplicates: {
+              status: validationResult.duplicate_check?.success ? 'pass' :
+                      (validationResult.duplicate_check?.error ? 'warning' : 'pass'),
+              count: validationResult.duplicate_check?.duplicate_count || 0,
+              message: validationResult.duplicate_check?.error || `${validFileCount} files validated`,
+              isExpanded: getExpandedState('validation', 'duplicates')
+            },
+            completeness: {
+              status: validationResult.completeness_check?.success ? 'pass' : 'warning',
+              progress: 100,
+              message: `${validFileCount} files complete`
+            },
+            filename: {
+              status: validationResult.name_validation?.success ? 'pass' : 'warning',
+              message: validationResult.name_validation?.error || 'File names validated'
+            }
+          }
+        };
+      }
+
+      // Extract SQL Load results
+      const sqlLoadResult = detailsData.sqlLoadResult;
+      if (sqlLoadResult) {
+        // Separate files by source (RHUM vs HACIENDA/FIMAS)
+        const loadResults = sqlLoadResult.load_results || [];
+        const rhumFiles = loadResults.filter(f => f.filename?.toLowerCase().includes('rhum'));
+        const haciendaFiles = loadResults.filter(f => !f.filename?.toLowerCase().includes('rhum'));
+
+        newStepData.sql_load = {
+          status: sqlLoadResult.success ? 'pass' : (sqlLoadResult.files_processed > 0 ? 'warning' : 'fail'),
+          duration: 0,
+          filesProcessed: sqlLoadResult.files_processed || 0,
+          filesLoaded: sqlLoadResult.files_loaded || 0,
+          totalRows: sqlLoadResult.total_rows || 0,
+          reportKey: sqlLoadResult.report_key,
+          subTasks: {
+            rhum: {
+              status: rhumFiles.length > 0 ? 'pass' : 'pending',
+              count: rhumFiles.length,
+              files: rhumFiles.map(f => ({
+                name: f.filename,
+                status: f.success ? 'completed' : 'failed'
+              })),
+              isExpanded: getExpandedState('sql_load', 'rhum')
+            },
+            hacienda: {
+              status: haciendaFiles.length > 0 ? 'pass' : 'pending',
+              count: haciendaFiles.length,
+              files: haciendaFiles.map(f => ({
+                name: f.filename,
+                status: f.success ? 'completed' : 'failed'
+              })),
+              isExpanded: getExpandedState('sql_load', 'hacienda')
+            }
+          }
+        };
+      }
+
+      // Extract Stored Procedure results
+      const procStartResult = detailsData.procStartResult;
+      const procStatus = detailsData.procStatus;
+      if (procStartResult || procStatus) {
+        const isRunning = procStatus && !procStatus.is_completed;
+        const startTime = procStartResult?.timestamp ? new Date(procStartResult.timestamp) : null;
+        const procDuration = startTime ? Math.round((new Date() - startTime) / 1000) : 0;
+
+        // Calculate total delta records for display
+        const deltaCounts = procStatus?.delta_counts || {};
+        const totalDeltas = Object.values(deltaCounts).reduce((sum, count) => sum + (count || 0), 0);
+
+        // Build delta file list for display
+        const deltaFiles = Object.entries(deltaCounts).map(([table, count]) => ({
+          name: table.replace('_DELTA', ''),
+          status: count > 0 ? 'completed' : 'pending',
+          count: count
+        }));
+
+        newStepData.stored_procedure = {
+          status: procStatus?.is_completed ? 'pass' : (isRunning ? 'in progress' : 'pending'),
+          duration: procDuration,
+          currentStep: procStatus?.current_step || procStatus?.status || 'running',
+          deltaCounts: deltaCounts,
+          totalDeltas: totalDeltas,
+          subTasks: {
+            person: {
+              status: isRunning || procStatus?.is_completed ? 'pass' : 'in progress',
+              message: `Processing records...`
+            },
+            business: {
+              status: isRunning ? 'in progress' : 'pending',
+              message: totalDeltas > 0 ? `${totalDeltas} delta records generated` : 'Validating...',
+              count: totalDeltas,
+              files: deltaFiles,
+              isExpanded: getExpandedState('stored_procedure', 'business')
+            },
+            summary: {
+              status: procStatus?.is_completed ? 'pass' : 'pending',
+              message: procStatus?.is_completed ? 'Summary tables generated' : 'Waiting...'
+            }
+          }
+        };
+      }
+
+      // Update current step to 'in progress' if running
       if (currentStepId && status.status === 'RUNNING') {
-        newStepData[currentStepId] = { ...newStepData[currentStepId], status: 'in progress' };
+        if (!newStepData[currentStepId]) {
+          newStepData[currentStepId] = { status: 'in progress', duration: 0, subTasks: {} };
+        } else {
+          newStepData[currentStepId] = { ...newStepData[currentStepId], status: 'in progress' };
+        }
         setExpandedSteps(prev => ({ ...prev, [currentStepId]: true }));
       }
 
+      // Store in ref and update state
+      stepDataRef.current = newStepData;
       setStepData(newStepData);
-      const completedCount = Object.values(newStepData).filter(s => s.status === 'pass').length;
+
+      // Calculate progress based on completed steps
+      let completedCount = 0;
+      if (newStepData.sftp_download?.status === 'pass') completedCount++;
+      if (newStepData.validation?.status === 'pass') completedCount++;
+      if (newStepData.sql_load?.status === 'pass' || newStepData.sql_load?.status === 'warning') completedCount++;
+      if (newStepData.stored_procedure?.status === 'pass') completedCount++;
+      if (newStepData.delta_export?.status === 'pass') completedCount++;
+      if (newStepData.generate_report?.status === 'pass') completedCount++;
+
       setOverallProgress(Math.round((completedCount / PIPELINE_STEPS.length) * 100));
 
       if (status.status === 'SUCCEEDED') {
         setOverallProgress(100);
         stopPolling();
-        const allComplete = {};
-        PIPELINE_STEPS.forEach(step => { allComplete[step.id] = { status: 'pass', duration: 0 }; });
-        setStepData(allComplete);
       } else if (status.status === 'FAILED' || status.status === 'TIMED_OUT' || status.status === 'ABORTED') {
         setError(status.error || status.cause || 'Pipeline failed');
         stopPolling();
@@ -547,7 +743,7 @@ function PipelineInterface() {
     } catch (err) {
       console.error('Error polling status:', err);
     }
-  }, [stepData]);
+  }, []);
 
   const stopPolling = () => {
     setIsRunning(false);
