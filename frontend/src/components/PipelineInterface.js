@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { startPipeline, getPipelineStatus, listPipelineExecutions } from '../services/api';
 
-// Pipeline steps with their sub-tasks
+// Pipeline steps with their sub-tasks (some sub-tasks are expandable to show files/details)
 const PIPELINE_STEPS = [
   {
     id: 'sftp_download',
@@ -9,8 +9,8 @@ const PIPELINE_STEPS = [
     reportFile: 'Downloaded Files.txt',
     subTasks: [
       { id: 'connect', label: 'SFTP Connection' },
-      { id: 'discover', label: 'Discover Files', showCount: true },
-      { id: 'download', label: 'Download Files', showProgress: true }
+      { id: 'discover', label: 'Discover Files', expandable: true, expandLabel: 'files identified' },
+      { id: 'download', label: 'Download Files', expandable: true, expandLabel: 'files', showProgress: true }
     ]
   },
   {
@@ -18,7 +18,7 @@ const PIPELINE_STEPS = [
     label: 'Validations',
     reportFile: null,
     subTasks: [
-      { id: 'duplicates', label: 'Duplicate/Obsolete Validation', reportFile: 'Duplicate-Obsolete Validation.txt' },
+      { id: 'duplicates', label: 'Duplicate/Obsolete Validation', reportFile: 'Duplicate-Obsolete Validation.txt', expandable: true },
       { id: 'completeness', label: 'Completeness Validation', reportFile: 'Completeness Validation.txt', showProgress: true },
       { id: 'filename', label: 'File Name Validation', reportFile: 'File Name Validation.txt' }
     ]
@@ -28,8 +28,8 @@ const PIPELINE_STEPS = [
     label: 'Load to Database',
     reportFile: 'Load Database Report.txt',
     subTasks: [
-      { id: 'rhum', label: 'RHUM Tables' },
-      { id: 'hacienda', label: 'HACIENDA Tables' }
+      { id: 'rhum', label: 'RHUM Tables', expandable: true, expandLabel: 'tables' },
+      { id: 'hacienda', label: 'HACIENDA Tables', expandable: true, expandLabel: 'tables' }
     ]
   },
   {
@@ -47,8 +47,8 @@ const PIPELINE_STEPS = [
     label: 'Generate Export Files',
     reportFile: 'Generate Files Report.txt',
     subTasks: [
-      { id: 'rhum', label: 'RHUM Files' },
-      { id: 'hacienda', label: 'HACIENDA Files' }
+      { id: 'rhum', label: 'RHUM Files', expandable: true, expandLabel: 'files' },
+      { id: 'hacienda', label: 'HACIENDA Files', expandable: true, expandLabel: 'files' }
     ]
   },
   {
@@ -75,13 +75,12 @@ const COLORS = {
   textSecondary: '#64748b'
 };
 
-// Format duration in Xh Xm Xs or Xm Xs or Xs format
+// Format duration
 const formatDuration = (seconds) => {
   if (!seconds && seconds !== 0) return '--';
   const hrs = Math.floor(seconds / 3600);
   const mins = Math.floor((seconds % 3600) / 60);
   const secs = Math.floor(seconds % 60);
-
   if (hrs > 0) return `${hrs}h ${mins}m ${secs}s`;
   if (mins > 0) return `${mins}m ${secs}s`;
   return `${secs}s`;
@@ -92,13 +91,8 @@ const formatDateTime = (date) => {
   if (!date) return '--';
   const d = new Date(date);
   return d.toLocaleString('en-US', {
-    month: 'numeric',
-    day: 'numeric',
-    year: 'numeric',
-    hour: 'numeric',
-    minute: '2-digit',
-    second: '2-digit',
-    hour12: true
+    month: 'numeric', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true
   });
 };
 
@@ -110,17 +104,11 @@ const StatusBadge = ({ status }) => {
     'in progress': { backgroundColor: '#dbeafe', color: '#2563eb', border: '1px solid #93c5fd' },
     pending: { backgroundColor: '#f1f5f9', color: '#64748b', border: '1px solid #cbd5e1' }
   };
-
   const style = styles[status?.toLowerCase()] || styles.pending;
-
   return (
     <span style={{
-      padding: '4px 12px',
-      borderRadius: '20px',
-      fontSize: '12px',
-      fontWeight: '600',
-      textTransform: 'uppercase',
-      ...style
+      padding: '4px 12px', borderRadius: '20px', fontSize: '12px',
+      fontWeight: '600', textTransform: 'uppercase', ...style
     }}>
       {status || 'PENDING'}
     </span>
@@ -132,12 +120,8 @@ const ReportLink = ({ filename }) => {
   if (!filename) return null;
   return (
     <span style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      gap: '4px',
-      color: COLORS.primary,
-      fontSize: '13px',
-      cursor: 'pointer'
+      display: 'inline-flex', alignItems: 'center', gap: '4px',
+      color: COLORS.primary, fontSize: '13px', cursor: 'pointer'
     }}>
       <span>📄</span>
       <span style={{ textDecoration: 'underline' }}>{filename}</span>
@@ -146,73 +130,124 @@ const ReportLink = ({ filename }) => {
 };
 
 // Info Message Component (orange text)
-const InfoMessage = ({ message }) => {
+const InfoMessage = ({ message, onClick, expandable }) => {
   if (!message) return null;
   return (
-    <div style={{
-      display: 'flex',
-      alignItems: 'center',
-      gap: '6px',
-      color: COLORS.warning,
-      fontSize: '13px',
-      marginTop: '4px'
-    }}>
+    <div
+      onClick={onClick}
+      style={{
+        display: 'flex', alignItems: 'center', gap: '6px',
+        color: COLORS.warning, fontSize: '13px', marginTop: '4px',
+        cursor: expandable ? 'pointer' : 'default'
+      }}
+    >
       <span>ⓘ</span>
       <span>{message}</span>
+      {expandable && <span style={{ fontSize: '10px' }}>▼</span>}
     </div>
   );
 };
 
-// Sub-Task Component
-const SubTask = ({ step, subTask, subTaskData, stepNumber, subIndex }) => {
+// File List Component (shown when sub-task is expanded)
+const FileList = ({ files, label }) => {
+  if (!files || files.length === 0) return null;
+  return (
+    <div style={{
+      marginTop: '12px', marginLeft: '24px', padding: '12px',
+      backgroundColor: '#f8fafc', borderRadius: '6px', border: '1px solid #e2e8f0'
+    }}>
+      <div style={{ fontSize: '12px', color: COLORS.textSecondary, marginBottom: '8px', fontWeight: '600' }}>
+        {label || 'Files'} ({files.length})
+      </div>
+      <div style={{ maxHeight: '200px', overflowY: 'auto' }}>
+        {files.map((file, idx) => (
+          <div key={idx} style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            padding: '6px 8px', fontSize: '13px',
+            backgroundColor: idx % 2 === 0 ? 'transparent' : '#f1f5f9',
+            borderRadius: '4px'
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <span style={{ color: '#64748b' }}>📄</span>
+              <span style={{ fontFamily: 'monospace', color: COLORS.textPrimary }}>{file.name || file}</span>
+            </div>
+            {file.size && (
+              <span style={{ color: COLORS.textSecondary, fontSize: '12px' }}>{file.size}</span>
+            )}
+            {file.status && (
+              <span style={{
+                color: file.status === 'completed' ? COLORS.success : COLORS.primary,
+                fontSize: '12px'
+              }}>
+                {file.status === 'completed' ? '✓' : '...'}
+              </span>
+            )}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
+// Sub-Task Component (now expandable)
+const SubTask = ({ subTask, subTaskData, stepNumber, subIndex, onToggleExpand }) => {
   const status = subTaskData?.status || 'pending';
   const duration = subTaskData?.duration;
   const progress = subTaskData?.progress;
   const message = subTaskData?.message;
-  const isExpanded = subTaskData?.expanded;
+  const isExpanded = subTaskData?.isExpanded;
+  const files = subTaskData?.files || [];
+  const count = subTaskData?.count;
+
+  // Generate info message
+  let infoMessage = message;
+  if (!infoMessage && count !== undefined && subTask.expandLabel) {
+    infoMessage = `${count} ${subTask.expandLabel}`;
+  }
 
   return (
     <div style={{
       backgroundColor: status === 'fail' ? '#fef2f2' : COLORS.bgWhite,
-      borderRadius: '8px',
-      padding: '12px 16px',
-      marginLeft: '24px',
+      borderRadius: '8px', padding: '12px 16px', marginLeft: '24px',
       border: `1px solid ${status === 'fail' ? '#fecaca' : COLORS.border}`
     }}>
-      <div style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'flex-start'
-      }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
         <div style={{ flex: 1 }}>
-          <div style={{
-            display: 'flex',
-            alignItems: 'center',
-            gap: '8px'
-          }}>
-            {subTask.subTasks && (
-              <span style={{ color: COLORS.textSecondary, cursor: 'pointer' }}>›</span>
+          <div
+            style={{ display: 'flex', alignItems: 'center', gap: '8px', cursor: subTask.expandable ? 'pointer' : 'default' }}
+            onClick={() => subTask.expandable && onToggleExpand && onToggleExpand()}
+          >
+            {subTask.expandable && (
+              <span style={{
+                color: COLORS.textSecondary, fontSize: '10px',
+                transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
+                transition: 'transform 0.2s'
+              }}>▶</span>
             )}
             <span style={{ fontWeight: '500', color: COLORS.textPrimary }}>
               Step {stepNumber}.{subIndex + 1} - {subTask.label}
             </span>
           </div>
-          {message && <InfoMessage message={message} />}
-          {subTask.showProgress && progress !== undefined && status === 'in progress' && (
+
+          {infoMessage && (
+            <InfoMessage
+              message={infoMessage}
+              expandable={subTask.expandable && files.length > 0}
+              onClick={() => subTask.expandable && onToggleExpand && onToggleExpand()}
+            />
+          )}
+
+          {/* Progress bar for long-running tasks */}
+          {subTask.showProgress && progress !== undefined && (status === 'in progress' || status === 'pass') && (
             <div style={{ marginTop: '8px' }}>
               <div style={{
-                height: '6px',
-                backgroundColor: '#e2e8f0',
-                borderRadius: '3px',
-                overflow: 'hidden',
-                marginBottom: '4px'
+                height: '6px', backgroundColor: '#e2e8f0', borderRadius: '3px',
+                overflow: 'hidden', marginBottom: '4px'
               }}>
                 <div style={{
-                  height: '100%',
-                  width: `${progress}%`,
-                  backgroundColor: COLORS.primary,
-                  borderRadius: '3px',
-                  transition: 'width 0.3s ease'
+                  height: '100%', width: `${progress}%`,
+                  backgroundColor: status === 'pass' ? COLORS.success : COLORS.primary,
+                  borderRadius: '3px', transition: 'width 0.3s ease'
                 }} />
               </div>
               <div style={{ textAlign: 'right', fontSize: '12px', color: COLORS.textSecondary }}>
@@ -220,19 +255,18 @@ const SubTask = ({ step, subTask, subTaskData, stepNumber, subIndex }) => {
               </div>
             </div>
           )}
+
+          {/* Expanded file list */}
+          {isExpanded && files.length > 0 && (
+            <FileList files={files} label={subTask.expandLabel} />
+          )}
         </div>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px'
-        }}>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           {duration !== undefined && (
             <span style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '4px',
-              color: COLORS.textSecondary,
-              fontSize: '13px'
+              display: 'flex', alignItems: 'center', gap: '4px',
+              color: COLORS.textSecondary, fontSize: '13px'
             }}>
               <span>⏱</span>
               {formatDuration(duration)}
@@ -247,7 +281,7 @@ const SubTask = ({ step, subTask, subTaskData, stepNumber, subIndex }) => {
 };
 
 // Step Card Component
-const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle }) => {
+const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle, onToggleSubTask }) => {
   const status = stepData?.status || 'pending';
   const duration = stepData?.duration;
   const subTasks = stepData?.subTasks || {};
@@ -268,69 +302,41 @@ const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle }) => {
 
   return (
     <div style={{
-      backgroundColor: COLORS.bgWhite,
-      borderRadius: '12px',
-      border: `1px solid ${COLORS.border}`,
-      marginBottom: '12px',
-      overflow: 'hidden'
+      backgroundColor: COLORS.bgWhite, borderRadius: '12px',
+      border: `1px solid ${COLORS.border}`, marginBottom: '12px', overflow: 'hidden'
     }}>
       {/* Step Header */}
       <div
         onClick={onToggle}
         style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'center',
-          padding: '16px 20px',
-          cursor: 'pointer',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          padding: '16px 20px', cursor: 'pointer',
           backgroundColor: status === 'in progress' ? '#f0f7ff' : 'transparent'
         }}
       >
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '12px'
-        }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <span style={{
             transform: isExpanded ? 'rotate(90deg)' : 'rotate(0deg)',
-            transition: 'transform 0.2s',
-            color: COLORS.textSecondary
+            transition: 'transform 0.2s', color: COLORS.textSecondary
           }}>▶</span>
           <span style={{
-            width: '28px',
-            height: '28px',
-            borderRadius: '50%',
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
+            width: '28px', height: '28px', borderRadius: '50%',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
             backgroundColor: status === 'pending' ? COLORS.bgLight : 'transparent',
-            border: `2px solid ${getIconColor()}`,
-            color: getIconColor(),
-            fontSize: '14px',
-            fontWeight: 'bold'
+            border: `2px solid ${getIconColor()}`, color: getIconColor(),
+            fontSize: '14px', fontWeight: 'bold'
           }}>
             {getStepIcon()}
           </span>
-          <span style={{
-            fontWeight: '600',
-            fontSize: '15px',
-            color: COLORS.textPrimary
-          }}>
+          <span style={{ fontWeight: '600', fontSize: '15px', color: COLORS.textPrimary }}>
             Step {stepNumber} - {step.label}
           </span>
         </div>
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '16px'
-        }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
           {duration !== undefined && (
             <span style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: '4px',
-              color: COLORS.textSecondary,
-              fontSize: '13px'
+              display: 'flex', alignItems: 'center', gap: '4px',
+              color: COLORS.textSecondary, fontSize: '13px'
             }}>
               <span>⏱</span>
               {formatDuration(duration)}
@@ -343,20 +349,15 @@ const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle }) => {
 
       {/* Expanded Content */}
       {isExpanded && (
-        <div style={{
-          padding: '0 20px 16px 20px',
-          display: 'flex',
-          flexDirection: 'column',
-          gap: '8px'
-        }}>
+        <div style={{ padding: '0 20px 16px 20px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
           {step.subTasks.map((subTask, idx) => (
             <SubTask
               key={subTask.id}
-              step={step}
               subTask={subTask}
               subTaskData={subTasks[subTask.id]}
               stepNumber={stepNumber}
               subIndex={idx}
+              onToggleExpand={() => onToggleSubTask(step.id, subTask.id)}
             />
           ))}
         </div>
@@ -369,35 +370,21 @@ const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle }) => {
 const HistoryListItem = ({ process, onClick }) => {
   const status = process.status === 'SUCCEEDED' ? 'Pass' :
                  process.status === 'FAILED' ? 'Fail' : 'In Progress';
-
   return (
     <div
       onClick={onClick}
       style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        padding: '16px 20px',
-        borderBottom: `1px solid ${COLORS.border}`,
-        cursor: 'pointer',
-        transition: 'background-color 0.2s',
-        ':hover': { backgroundColor: COLORS.bgLight }
+        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+        padding: '16px 20px', borderBottom: `1px solid ${COLORS.border}`,
+        cursor: 'pointer', transition: 'background-color 0.2s'
       }}
       onMouseEnter={(e) => e.currentTarget.style.backgroundColor = COLORS.bgLight}
       onMouseLeave={(e) => e.currentTarget.style.backgroundColor = 'transparent'}
     >
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '12px'
-      }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
         <span style={{
-          width: '24px',
-          height: '24px',
-          borderRadius: '50%',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
+          width: '24px', height: '24px', borderRadius: '50%',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
           backgroundColor: status === 'Pass' ? '#dcfce7' : status === 'Fail' ? '#fee2e2' : '#dbeafe',
           color: status === 'Pass' ? COLORS.success : status === 'Fail' ? COLORS.error : COLORS.primary,
           fontSize: '12px'
@@ -413,11 +400,7 @@ const HistoryListItem = ({ process, onClick }) => {
           </div>
         </div>
       </div>
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '16px'
-      }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '16px' }}>
         <span style={{ color: COLORS.textSecondary, fontSize: '13px' }}>
           Duration: {formatDuration(process.duration)}
         </span>
@@ -429,10 +412,7 @@ const HistoryListItem = ({ process, onClick }) => {
 
 // Main Component
 function PipelineInterface() {
-  // Tab state
-  const [activeTab, setActiveTab] = useState('active'); // 'active' or 'history'
-
-  // Active process state
+  const [activeTab, setActiveTab] = useState('active');
   const [isRunning, setIsRunning] = useState(false);
   const [executionId, setExecutionId] = useState(null);
   const [processInfo, setProcessInfo] = useState(null);
@@ -441,18 +421,15 @@ function PipelineInterface() {
   const [overallProgress, setOverallProgress] = useState(0);
   const [error, setError] = useState(null);
   const [elapsedTime, setElapsedTime] = useState(0);
-
-  // History state
   const [historyList, setHistoryList] = useState([]);
   const [selectedHistory, setSelectedHistory] = useState(null);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
-  // Refs
   const timerRef = useRef(null);
   const pollingRef = useRef(null);
   const startTimeRef = useRef(null);
 
-  // Load history when tab changes
+  // Load history
   useEffect(() => {
     if (activeTab === 'history' && !selectedHistory) {
       loadHistoryList();
@@ -472,7 +449,6 @@ function PipelineInterface() {
 
   const viewHistoryDetail = async (process) => {
     setSelectedHistory(process);
-    // Load full details if needed
     if (process.executionId) {
       try {
         const details = await getPipelineStatus(process.executionId);
@@ -483,15 +459,26 @@ function PipelineInterface() {
     }
   };
 
-  // Toggle step expansion
   const toggleStep = (stepId) => {
-    setExpandedSteps(prev => ({
+    setExpandedSteps(prev => ({ ...prev, [stepId]: !prev[stepId] }));
+  };
+
+  const toggleSubTask = (stepId, subTaskId) => {
+    setStepData(prev => ({
       ...prev,
-      [stepId]: !prev[stepId]
+      [stepId]: {
+        ...prev[stepId],
+        subTasks: {
+          ...prev[stepId]?.subTasks,
+          [subTaskId]: {
+            ...prev[stepId]?.subTasks?.[subTaskId],
+            isExpanded: !prev[stepId]?.subTasks?.[subTaskId]?.isExpanded
+          }
+        }
+      }
     }));
   };
 
-  // Map Step Functions state to step ID
   const mapStateToStepId = (stateName) => {
     const stateMap = {
       'SftpDownload': 'sftp_download',
@@ -510,15 +497,12 @@ function PipelineInterface() {
     return stateMap[stateName] || null;
   };
 
-  // Poll for status
   const pollStatus = useCallback(async () => {
     if (!executionId) return;
-
     try {
       const status = await getPipelineStatus(executionId);
       const currentStepId = mapStateToStepId(status.current_state);
 
-      // Update process info
       setProcessInfo({
         id: executionId.split(':').pop()?.slice(0, 15),
         startDate: status.startDate || startTimeRef.current,
@@ -526,10 +510,7 @@ function PipelineInterface() {
         status: status.status
       });
 
-      // Update step data
       const newStepData = { ...stepData };
-
-      // Mark completed steps
       if (status.completed_states) {
         status.completed_states.forEach(state => {
           const stepId = mapStateToStepId(state);
@@ -539,38 +520,25 @@ function PipelineInterface() {
         });
       }
 
-      // Mark current step
       if (currentStepId && status.status === 'RUNNING') {
-        newStepData[currentStepId] = {
-          ...newStepData[currentStepId],
-          status: 'in progress'
-        };
-
-        // Auto-expand current step
+        newStepData[currentStepId] = { ...newStepData[currentStepId], status: 'in progress' };
         setExpandedSteps(prev => ({ ...prev, [currentStepId]: true }));
       }
 
       setStepData(newStepData);
-
-      // Calculate overall progress
       const completedCount = Object.values(newStepData).filter(s => s.status === 'pass').length;
       setOverallProgress(Math.round((completedCount / PIPELINE_STEPS.length) * 100));
 
-      // Check completion
       if (status.status === 'SUCCEEDED') {
         setOverallProgress(100);
         stopPolling();
-        // Mark all steps complete
         const allComplete = {};
-        PIPELINE_STEPS.forEach(step => {
-          allComplete[step.id] = { status: 'pass', duration: 0 };
-        });
+        PIPELINE_STEPS.forEach(step => { allComplete[step.id] = { status: 'pass', duration: 0 }; });
         setStepData(allComplete);
       } else if (status.status === 'FAILED' || status.status === 'TIMED_OUT') {
         setError(status.error || 'Pipeline failed');
         stopPolling();
       }
-
     } catch (err) {
       console.error('Error polling status:', err);
     }
@@ -578,17 +546,10 @@ function PipelineInterface() {
 
   const stopPolling = () => {
     setIsRunning(false);
-    if (timerRef.current) {
-      clearInterval(timerRef.current);
-      timerRef.current = null;
-    }
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
+    if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
+    if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
   };
 
-  // Start pipeline
   const handleStartPipeline = async () => {
     setIsRunning(true);
     setError(null);
@@ -607,16 +568,9 @@ function PipelineInterface() {
 
     try {
       const response = await startPipeline({ test_execution: false });
-
       if (response.execution_id) {
         setExecutionId(response.execution_id);
-
-        // Start timer
-        timerRef.current = setInterval(() => {
-          setElapsedTime(prev => prev + 1);
-        }, 1000);
-
-        // Start polling
+        timerRef.current = setInterval(() => { setElapsedTime(prev => prev + 1); }, 1000);
         pollingRef.current = setInterval(pollStatus, 10000);
         setTimeout(pollStatus, 3000);
       } else {
@@ -628,7 +582,6 @@ function PipelineInterface() {
     }
   };
 
-  // Cleanup
   useEffect(() => {
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
@@ -636,40 +589,65 @@ function PipelineInterface() {
     };
   }, []);
 
-  // Restart polling when executionId changes
   useEffect(() => {
     if (executionId && isRunning && !pollingRef.current) {
       pollingRef.current = setInterval(pollStatus, 10000);
     }
   }, [executionId, isRunning, pollStatus]);
 
+  // Generate mock data for history detail view
+  const generateHistoryStepData = (process) => {
+    const data = {};
+    const isFailed = process.status === 'FAILED';
+
+    // Sample files for demonstration
+    const sampleFiles = [
+      'HCM_PERSON_RHUM_20260206.csv',
+      'HCM_PERSON_HACIENDA_20260206.csv',
+      'HCM_ASSIGNMENT_RHUM_20260206.csv',
+      'HCM_ASSIGNMENT_HACIENDA_20260206.csv',
+      'HCM_SALARY_RHUM_20260206.csv',
+      'HCM_SALARY_HACIENDA_20260206.csv'
+    ];
+
+    PIPELINE_STEPS.forEach((step, idx) => {
+      const stepFailed = isFailed && idx === 1; // Fail at validation for demo
+      data[step.id] = {
+        status: stepFailed ? 'fail' : (idx < (isFailed ? 1 : PIPELINE_STEPS.length) ? 'pass' : 'pending'),
+        duration: stepFailed ? 0 : Math.floor(Math.random() * 300) + 30,
+        subTasks: {}
+      };
+
+      step.subTasks.forEach((subTask, subIdx) => {
+        const subFailed = stepFailed && subIdx === 0;
+        data[step.id].subTasks[subTask.id] = {
+          status: subFailed ? 'fail' : data[step.id].status,
+          duration: Math.floor(Math.random() * 60) + 5,
+          count: subTask.expandable ? sampleFiles.length : undefined,
+          message: subFailed ? 'Multiple duplicate files detected' : undefined,
+          files: subTask.expandable ? sampleFiles.map(f => ({ name: f, status: 'completed' })) : [],
+          progress: subTask.showProgress ? 100 : undefined,
+          isExpanded: false
+        };
+      });
+    });
+
+    return data;
+  };
+
   return (
     <div style={{ maxWidth: '1000px', margin: '0 auto', padding: '20px' }}>
-      {/* Header */}
-      <h1 style={{
-        fontSize: '24px',
-        fontWeight: '700',
-        color: COLORS.textPrimary,
-        marginBottom: '20px'
-      }}>
+      <h1 style={{ fontSize: '24px', fontWeight: '700', color: COLORS.textPrimary, marginBottom: '20px' }}>
         Sterling Process Monitor
       </h1>
 
       {/* Tabs */}
-      <div style={{
-        display: 'flex',
-        gap: '8px',
-        marginBottom: '24px'
-      }}>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '24px' }}>
         <button
           onClick={() => { setActiveTab('active'); setSelectedHistory(null); }}
           style={{
-            padding: '10px 24px',
-            borderRadius: '8px',
-            border: 'none',
-            fontSize: '14px',
-            fontWeight: '600',
-            cursor: 'pointer',
+            padding: '10px 24px', borderRadius: '8px', border: 'none',
+            fontSize: '14px', fontWeight: '600', cursor: 'pointer',
             backgroundColor: activeTab === 'active' ? COLORS.primary : COLORS.bgLight,
             color: activeTab === 'active' ? 'white' : COLORS.textSecondary
           }}
@@ -679,12 +657,8 @@ function PipelineInterface() {
         <button
           onClick={() => setActiveTab('history')}
           style={{
-            padding: '10px 24px',
-            borderRadius: '8px',
-            border: 'none',
-            fontSize: '14px',
-            fontWeight: '600',
-            cursor: 'pointer',
+            padding: '10px 24px', borderRadius: '8px', border: 'none',
+            fontSize: '14px', fontWeight: '600', cursor: 'pointer',
             backgroundColor: activeTab === 'history' ? COLORS.primary : COLORS.bgLight,
             color: activeTab === 'history' ? 'white' : COLORS.textSecondary
           }}
@@ -696,25 +670,12 @@ function PipelineInterface() {
       {/* Active Process Tab */}
       {activeTab === 'active' && (
         <div style={{
-          backgroundColor: COLORS.bgWhite,
-          borderRadius: '12px',
-          border: `1px solid ${COLORS.border}`,
-          padding: '24px'
+          backgroundColor: COLORS.bgWhite, borderRadius: '12px',
+          border: `1px solid ${COLORS.border}`, padding: '24px'
         }}>
-          {/* Process Header */}
-          <div style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'flex-start',
-            marginBottom: '24px'
-          }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '24px' }}>
             <div>
-              <h2 style={{
-                fontSize: '18px',
-                fontWeight: '600',
-                color: COLORS.textPrimary,
-                margin: '0 0 8px 0'
-              }}>
+              <h2 style={{ fontSize: '18px', fontWeight: '600', color: COLORS.textPrimary, margin: '0 0 8px 0' }}>
                 Current Process
               </h2>
               {processInfo && (
@@ -722,12 +683,8 @@ function PipelineInterface() {
                   Started: {formatDateTime(processInfo.startDate)}
                   {processInfo.endDate && <> &nbsp;·&nbsp; Ended: {formatDateTime(processInfo.endDate)}</>}
                   <span style={{
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: '4px',
-                    marginLeft: '16px',
-                    color: COLORS.primary,
-                    fontWeight: '600'
+                    display: 'inline-flex', alignItems: 'center', gap: '4px',
+                    marginLeft: '16px', color: COLORS.primary, fontWeight: '600'
                   }}>
                     <span>⏱</span>
                     {formatDuration(elapsedTime)}
@@ -740,14 +697,8 @@ function PipelineInterface() {
                 <button
                   onClick={handleStartPipeline}
                   style={{
-                    padding: '12px 24px',
-                    backgroundColor: COLORS.success,
-                    color: 'white',
-                    border: 'none',
-                    borderRadius: '8px',
-                    fontSize: '14px',
-                    fontWeight: '600',
-                    cursor: 'pointer'
+                    padding: '12px 24px', backgroundColor: COLORS.success, color: 'white',
+                    border: 'none', borderRadius: '8px', fontSize: '14px', fontWeight: '600', cursor: 'pointer'
                   }}
                 >
                   ▶ Start Pipeline
@@ -763,49 +714,32 @@ function PipelineInterface() {
             </div>
           </div>
 
-          {/* Overall Progress Bar */}
+          {/* Overall Progress */}
           {processInfo && (
             <div style={{ marginBottom: '24px' }}>
-              <div style={{
-                display: 'flex',
-                justifyContent: 'space-between',
-                marginBottom: '8px'
-              }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '8px' }}>
                 <span style={{ fontSize: '14px', color: COLORS.textSecondary }}>Overall Progress</span>
                 <span style={{ fontSize: '14px', fontWeight: '600', color: COLORS.textPrimary }}>{overallProgress}%</span>
               </div>
-              <div style={{
-                height: '8px',
-                backgroundColor: '#e2e8f0',
-                borderRadius: '4px',
-                overflow: 'hidden'
-              }}>
+              <div style={{ height: '8px', backgroundColor: '#e2e8f0', borderRadius: '4px', overflow: 'hidden' }}>
                 <div style={{
-                  height: '100%',
-                  width: `${overallProgress}%`,
+                  height: '100%', width: `${overallProgress}%`,
                   backgroundColor: error ? COLORS.error : overallProgress === 100 ? COLORS.success : COLORS.primary,
-                  borderRadius: '4px',
-                  transition: 'width 0.5s ease'
+                  borderRadius: '4px', transition: 'width 0.5s ease'
                 }} />
               </div>
             </div>
           )}
 
-          {/* Error Display */}
           {error && (
             <div style={{
-              backgroundColor: '#fef2f2',
-              border: '1px solid #fecaca',
-              borderRadius: '8px',
-              padding: '16px',
-              marginBottom: '24px',
-              color: COLORS.error
+              backgroundColor: '#fef2f2', border: '1px solid #fecaca',
+              borderRadius: '8px', padding: '16px', marginBottom: '24px', color: COLORS.error
             }}>
               <strong>Error:</strong> {error}
             </div>
           )}
 
-          {/* Steps */}
           {processInfo ? (
             <div>
               {PIPELINE_STEPS.map((step, idx) => (
@@ -816,57 +750,36 @@ function PipelineInterface() {
                   stepData={stepData[step.id]}
                   isExpanded={expandedSteps[step.id] || false}
                   onToggle={() => toggleStep(step.id)}
+                  onToggleSubTask={toggleSubTask}
                 />
               ))}
             </div>
           ) : (
-            <div style={{
-              textAlign: 'center',
-              padding: '60px 20px',
-              color: COLORS.textSecondary
-            }}>
+            <div style={{ textAlign: 'center', padding: '60px 20px', color: COLORS.textSecondary }}>
               <div style={{ fontSize: '48px', marginBottom: '16px' }}>📊</div>
-              <p style={{ fontSize: '16px', margin: 0 }}>
-                Click "Start Pipeline" to begin processing
-              </p>
+              <p style={{ fontSize: '16px', margin: 0 }}>Click "Start Pipeline" to begin processing</p>
             </div>
           )}
         </div>
       )}
 
-      {/* Process History Tab */}
+      {/* Process History List */}
       {activeTab === 'history' && !selectedHistory && (
-        <div style={{
-          backgroundColor: COLORS.bgWhite,
-          borderRadius: '12px',
-          border: `1px solid ${COLORS.border}`
-        }}>
+        <div style={{ backgroundColor: COLORS.bgWhite, borderRadius: '12px', border: `1px solid ${COLORS.border}` }}>
           <div style={{ padding: '20px', borderBottom: `1px solid ${COLORS.border}` }}>
-            <h2 style={{
-              fontSize: '18px',
-              fontWeight: '600',
-              color: COLORS.textPrimary,
-              margin: '0 0 4px 0'
-            }}>
+            <h2 style={{ fontSize: '18px', fontWeight: '600', color: COLORS.textPrimary, margin: '0 0 4px 0' }}>
               Process History
             </h2>
             <p style={{ fontSize: '14px', color: COLORS.textSecondary, margin: 0 }}>
               View all completed and failed processes
             </p>
           </div>
-
           {loadingHistory ? (
-            <div style={{ padding: '40px', textAlign: 'center', color: COLORS.textSecondary }}>
-              Loading...
-            </div>
+            <div style={{ padding: '40px', textAlign: 'center', color: COLORS.textSecondary }}>Loading...</div>
           ) : historyList.length > 0 ? (
             <div>
               {historyList.map((process, idx) => (
-                <HistoryListItem
-                  key={process.executionId || idx}
-                  process={process}
-                  onClick={() => viewHistoryDetail(process)}
-                />
+                <HistoryListItem key={process.executionId || idx} process={process} onClick={() => viewHistoryDetail(process)} />
               ))}
             </div>
           ) : (
@@ -880,53 +793,30 @@ function PipelineInterface() {
       {/* History Detail View */}
       {activeTab === 'history' && selectedHistory && (
         <div style={{
-          backgroundColor: COLORS.bgWhite,
-          borderRadius: '12px',
-          border: `1px solid ${COLORS.border}`,
-          padding: '24px'
+          backgroundColor: COLORS.bgWhite, borderRadius: '12px',
+          border: `1px solid ${COLORS.border}`, padding: '24px'
         }}>
-          {/* Back Link */}
           <div
             onClick={() => setSelectedHistory(null)}
             style={{
-              display: 'inline-flex',
-              alignItems: 'center',
-              gap: '8px',
-              color: COLORS.primary,
-              cursor: 'pointer',
-              marginBottom: '20px',
-              fontSize: '14px'
+              display: 'inline-flex', alignItems: 'center', gap: '8px',
+              color: COLORS.primary, cursor: 'pointer', marginBottom: '20px', fontSize: '14px'
             }}
           >
             ← Back to History
           </div>
 
-          {/* Process Header */}
-          <div style={{
-            display: 'flex',
-            justifyContent: 'space-between',
-            alignItems: 'flex-start',
-            marginBottom: '24px'
-          }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '24px' }}>
             <div>
-              <h2 style={{
-                fontSize: '18px',
-                fontWeight: '600',
-                color: COLORS.textPrimary,
-                margin: '0 0 8px 0'
-              }}>
+              <h2 style={{ fontSize: '18px', fontWeight: '600', color: COLORS.textPrimary, margin: '0 0 8px 0' }}>
                 Process #{selectedHistory.id || selectedHistory.executionId?.split(':').pop()?.slice(0, 15)}
               </h2>
               <div style={{ fontSize: '14px', color: COLORS.textSecondary }}>
                 Started: {formatDateTime(selectedHistory.startDate)}
                 {selectedHistory.stopDate && <> &nbsp;·&nbsp; Ended: {formatDateTime(selectedHistory.stopDate)}</>}
                 <span style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  gap: '4px',
-                  marginLeft: '16px',
-                  color: COLORS.primary,
-                  fontWeight: '600'
+                  display: 'inline-flex', alignItems: 'center', gap: '4px',
+                  marginLeft: '16px', color: COLORS.primary, fontWeight: '600'
                 }}>
                   <span>⏱</span>
                   {formatDuration(selectedHistory.duration)}
@@ -939,24 +829,31 @@ function PipelineInterface() {
             } />
           </div>
 
-          {/* Steps - show all as completed or failed based on overall status */}
-          <div>
-            {PIPELINE_STEPS.map((step, idx) => (
-              <StepCard
-                key={step.id}
-                step={step}
-                stepNumber={idx + 1}
-                stepData={{
-                  status: selectedHistory.status === 'SUCCEEDED' ? 'pass' :
-                          (idx < 2 && selectedHistory.status === 'FAILED') ? 'pass' :
-                          (idx === 2 && selectedHistory.status === 'FAILED') ? 'fail' : 'pass',
-                  duration: Math.floor(Math.random() * 300)
-                }}
-                isExpanded={expandedSteps[step.id] || false}
-                onToggle={() => toggleStep(step.id)}
-              />
-            ))}
-          </div>
+          {/* Steps with mock data */}
+          {(() => {
+            const historyStepData = generateHistoryStepData(selectedHistory);
+            return (
+              <div>
+                {PIPELINE_STEPS.map((step, idx) => (
+                  <StepCard
+                    key={step.id}
+                    step={step}
+                    stepNumber={idx + 1}
+                    stepData={historyStepData[step.id]}
+                    isExpanded={expandedSteps[step.id] || false}
+                    onToggle={() => toggleStep(step.id)}
+                    onToggleSubTask={(stepId, subTaskId) => {
+                      // For history view, toggle expansion in the mock data
+                      setExpandedSteps(prev => ({
+                        ...prev,
+                        [`${stepId}_${subTaskId}`]: !prev[`${stepId}_${subTaskId}`]
+                      }));
+                    }}
+                  />
+                ))}
+              </div>
+            );
+          })()}
         </div>
       )}
     </div>
