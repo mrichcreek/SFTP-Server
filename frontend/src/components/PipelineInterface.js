@@ -427,6 +427,7 @@ function PipelineInterface() {
 
   const timerRef = useRef(null);
   const pollingRef = useRef(null);
+  const executionIdRef = useRef(null);
   const startTimeRef = useRef(null);
 
   // Load history
@@ -498,21 +499,25 @@ function PipelineInterface() {
   };
 
   const pollStatus = useCallback(async () => {
-    if (!executionId) return;
+    // Use ref to get the current execution ID (avoids stale closure issue)
+    const currentExecutionId = executionIdRef.current;
+    if (!currentExecutionId) return;
     try {
-      const status = await getPipelineStatus(executionId);
-      const currentStepId = mapStateToStepId(status.current_state);
+      const status = await getPipelineStatus(currentExecutionId);
+      // API returns current_step and completed_steps (not current_state/completed_states)
+      const currentStepId = mapStateToStepId(status.current_step);
 
       setProcessInfo({
-        id: executionId.split(':').pop()?.slice(0, 15),
-        startDate: status.startDate || startTimeRef.current,
-        endDate: status.stopDate,
+        id: currentExecutionId.split(':').pop()?.slice(0, 15),
+        startDate: status.started_at || startTimeRef.current,
+        endDate: status.stopped_at,
         status: status.status
       });
 
       const newStepData = { ...stepData };
-      if (status.completed_states) {
-        status.completed_states.forEach(state => {
+      // API returns completed_steps array
+      if (status.completed_steps) {
+        status.completed_steps.forEach(state => {
           const stepId = mapStateToStepId(state);
           if (stepId && !newStepData[stepId]) {
             newStepData[stepId] = { status: 'pass', duration: 0 };
@@ -535,14 +540,14 @@ function PipelineInterface() {
         const allComplete = {};
         PIPELINE_STEPS.forEach(step => { allComplete[step.id] = { status: 'pass', duration: 0 }; });
         setStepData(allComplete);
-      } else if (status.status === 'FAILED' || status.status === 'TIMED_OUT') {
-        setError(status.error || 'Pipeline failed');
+      } else if (status.status === 'FAILED' || status.status === 'TIMED_OUT' || status.status === 'ABORTED') {
+        setError(status.error || status.cause || 'Pipeline failed');
         stopPolling();
       }
     } catch (err) {
       console.error('Error polling status:', err);
     }
-  }, [executionId, stepData]);
+  }, [stepData]);
 
   const stopPolling = () => {
     setIsRunning(false);
@@ -569,10 +574,13 @@ function PipelineInterface() {
     try {
       const response = await startPipeline({ test_execution: false });
       if (response.execution_id) {
+        // Set both ref (for immediate use) and state (for re-renders)
+        executionIdRef.current = response.execution_id;
         setExecutionId(response.execution_id);
         timerRef.current = setInterval(() => { setElapsedTime(prev => prev + 1); }, 1000);
-        pollingRef.current = setInterval(pollStatus, 10000);
-        setTimeout(pollStatus, 3000);
+        pollingRef.current = setInterval(pollStatus, 5000);
+        // First poll after 2 seconds
+        setTimeout(pollStatus, 2000);
       } else {
         throw new Error(response.error || 'Failed to start pipeline');
       }
