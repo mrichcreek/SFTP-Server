@@ -25,13 +25,14 @@ import sys
 import os
 
 # Configuration
+# Using same credentials as Lambda (from AWS Secrets Manager: Hacienda_ERP_MSSQL_Production)
 CONNECTION_STRING = (
     "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=localhost;"  # or 10.0.151.32 if running remotely
+    "SERVER=10.0.151.32,1433;"
     "DATABASE=Hacienda_ERP;"
-    "UID=lambda_functions;"  # Update with actual credentials
-    "PWD=YOUR_PASSWORD_HERE;"  # Update with actual password
-    "Encrypt=no;"
+    "UID=lambda_functions;"
+    "PWD=coPPer873;"
+    "Encrypt=yes;"
     "TrustServerCertificate=yes;"
 )
 
