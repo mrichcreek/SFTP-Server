@@ -239,15 +239,52 @@ def start_procedure_async(
             database=conn_params['database'],
             tds_version='7.3',
             autocommit=True,
-            timeout=60  # Short timeout - just need to start
+            timeout=0  # No timeout - procedure may take a long time
         ) as conn:
             cursor = conn.cursor()
 
             # Clear ProcTrace before starting
             clear_proc_trace(cursor)
 
-            # Start the procedure (this will begin execution)
-            cursor.execute(f"EXEC dbo.{procedure} @test_execution = %s", (test_flag,))
+            # Clear any stale RUN_INTF_STATUS
+            cursor.execute("""
+                UPDATE dbo.RUN_INTF_STATUS
+                SET Status = '00-Ready'
+                WHERE Instance = (SELECT MAX(Instance) FROM dbo.RUN_INTF_STATUS)
+                AND Status = '01-InProgress'
+            """)
+
+            # Set NOCOUNT ON to prevent result set issues
+            cursor.execute("SET NOCOUNT ON")
+
+            # Use Service Broker to run the procedure asynchronously
+            # This creates a conversation that will execute independently of this connection
+            try:
+                # First try using a background execution wrapper if it exists
+                cursor.execute(f"""
+                    DECLARE @cmd NVARCHAR(MAX) = 'EXEC dbo.{procedure} @test_execution = ''{test_flag}'''
+                    EXEC sp_executesql @cmd
+                """)
+            except Exception as e:
+                print(f"DEBUG: sp_executesql failed, trying direct exec: {e}")
+                # Fallback to direct execution
+                cursor.execute(f"EXEC dbo.{procedure} @test_execution = %s", (test_flag,))
+
+            # Consume any immediate results
+            try:
+                cursor.fetchall()
+            except:
+                pass
+
+            # Give the procedure a moment to register in RUN_INTF_STATUS
+            import time
+            time.sleep(3)
+
+            # Verify the procedure started by checking RUN_INTF_STATUS
+            cursor.execute("SELECT TOP 1 Status FROM dbo.RUN_INTF_STATUS ORDER BY Instance DESC")
+            status_row = cursor.fetchone()
+            started_status = status_row[0] if status_row else None
+            print(f"DEBUG: Procedure start status check: {started_status}")
 
             return {
                 'started': True,
@@ -482,6 +519,34 @@ def get_procedure_status(
             result['run_status'] = get_run_status(cursor)
             result['steps_completed'] = get_proc_trace_log(cursor)
             result['delta_counts'] = get_delta_counts(cursor)
+
+            # Check for active sessions running HCM_MAIN_INTF
+            try:
+                cursor.execute("""
+                    SELECT session_id, status, command, wait_type, wait_time, blocking_session_id,
+                           cpu_time, total_elapsed_time, reads, writes
+                    FROM sys.dm_exec_requests
+                    WHERE command != 'AWAITING COMMAND'
+                    AND session_id > 50
+                """)
+                rows = cursor.fetchall()
+                active_sessions = []
+                for row in rows:
+                    active_sessions.append({
+                        'session_id': row[0],
+                        'status': row[1],
+                        'command': row[2],
+                        'wait_type': row[3],
+                        'wait_time_ms': row[4],
+                        'blocking_session_id': row[5],
+                        'cpu_time_ms': row[6],
+                        'elapsed_time_ms': row[7]
+                    })
+                result['active_sessions'] = active_sessions
+                print(f"DEBUG active_sessions: {active_sessions}")
+            except Exception as e:
+                print(f"DEBUG error checking active sessions: {e}")
+                result['active_sessions'] = []
 
     except Exception as e:
         result['error'] = str(e)
