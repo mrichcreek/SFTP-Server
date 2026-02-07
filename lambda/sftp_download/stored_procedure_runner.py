@@ -203,6 +203,171 @@ def clear_run_status(
         print(f"Warning: Could not clear run status: {e}")
 
 
+def queue_procedure_request(
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
+    database: str = 'Hacienda_ERP',
+    procedure: str = 'HCM_MAIN_INTF',
+    test_mode: bool = False
+) -> Dict:
+    """
+    Queue a stored procedure request for execution by the server-side runner service.
+
+    Instead of running the procedure directly (which fails when Lambda connection closes),
+    this inserts a request into PROCEDURE_RUN_QUEUE table. A Python service running on
+    the SQL Server picks up the request and executes it with a persistent connection.
+
+    Args:
+        secret_name: AWS Secrets Manager secret
+        database: Target database
+        procedure: Procedure name to execute
+        test_mode: Whether to run in test mode
+
+    Returns:
+        Dict with request_id and queued status
+    """
+    import pymssql
+
+    test_flag = 'Y' if test_mode else 'N'
+
+    try:
+        connection_string = get_aws_secret(secret_name)
+        conn_params = parse_connection_string(connection_string)
+        conn_params['database'] = database
+
+        with pymssql.connect(
+            server=conn_params['server'],
+            port=conn_params.get('port', 1433),
+            user=conn_params['user'],
+            password=conn_params['password'],
+            database=conn_params['database'],
+            tds_version='7.3',
+            autocommit=True
+        ) as conn:
+            cursor = conn.cursor()
+
+            # Create queue table if it doesn't exist
+            cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'PROCEDURE_RUN_QUEUE')
+                BEGIN
+                    CREATE TABLE dbo.PROCEDURE_RUN_QUEUE (
+                        RequestID INT IDENTITY(1,1) PRIMARY KEY,
+                        ProcedureName NVARCHAR(255) NOT NULL,
+                        TestExecution CHAR(1) DEFAULT 'N',
+                        Status NVARCHAR(50) DEFAULT 'PENDING',
+                        RequestedAt DATETIME DEFAULT GETDATE(),
+                        StartedAt DATETIME NULL,
+                        CompletedAt DATETIME NULL,
+                        ErrorMessage NVARCHAR(MAX) NULL,
+                        RequestedBy NVARCHAR(255) DEFAULT 'Lambda'
+                    )
+                END
+            """)
+
+            # Insert the request
+            cursor.execute("""
+                INSERT INTO dbo.PROCEDURE_RUN_QUEUE (ProcedureName, TestExecution, RequestedBy)
+                OUTPUT INSERTED.RequestID
+                VALUES (%s, %s, 'Lambda-StepFunctions')
+            """, (procedure, test_flag))
+
+            row = cursor.fetchone()
+            request_id = row[0] if row else None
+
+            return {
+                'queued': True,
+                'request_id': request_id,
+                'procedure': procedure,
+                'test_mode': test_mode,
+                'database': database,
+                'queued_at': datetime.now().isoformat(),
+                'message': 'Request queued. Server-side runner will execute.'
+            }
+
+    except Exception as e:
+        return {
+            'queued': False,
+            'error': str(e),
+            'procedure': procedure
+        }
+
+
+def check_queue_status(
+    secret_name: str = 'Hacienda_ERP_MSSQL_Production',
+    database: str = 'Hacienda_ERP',
+    request_id: int = None
+) -> Dict:
+    """
+    Check the status of a queued procedure request.
+
+    Args:
+        secret_name: AWS Secrets Manager secret
+        database: Target database
+        request_id: Specific request ID to check, or None for latest
+
+    Returns:
+        Dict with request status
+    """
+    import pymssql
+
+    try:
+        connection_string = get_aws_secret(secret_name)
+        conn_params = parse_connection_string(connection_string)
+        conn_params['database'] = database
+
+        with pymssql.connect(
+            server=conn_params['server'],
+            port=conn_params.get('port', 1433),
+            user=conn_params['user'],
+            password=conn_params['password'],
+            database=conn_params['database'],
+            tds_version='7.3',
+            autocommit=True
+        ) as conn:
+            cursor = conn.cursor()
+
+            if request_id:
+                cursor.execute("""
+                    SELECT RequestID, ProcedureName, Status, RequestedAt, StartedAt, CompletedAt, ErrorMessage
+                    FROM dbo.PROCEDURE_RUN_QUEUE
+                    WHERE RequestID = %s
+                """, (request_id,))
+            else:
+                cursor.execute("""
+                    SELECT TOP 1 RequestID, ProcedureName, Status, RequestedAt, StartedAt, CompletedAt, ErrorMessage
+                    FROM dbo.PROCEDURE_RUN_QUEUE
+                    ORDER BY RequestID DESC
+                """)
+
+            row = cursor.fetchone()
+            if row:
+                status = row[2]
+                return {
+                    'request_id': row[0],
+                    'procedure': row[1],
+                    'status': status,
+                    'is_completed': status == 'COMPLETED',
+                    'is_failed': status == 'FAILED',
+                    'is_running': status == 'RUNNING',
+                    'is_pending': status == 'PENDING',
+                    'requested_at': str(row[3]) if row[3] else None,
+                    'started_at': str(row[4]) if row[4] else None,
+                    'completed_at': str(row[5]) if row[5] else None,
+                    'error_message': row[6]
+                }
+            else:
+                return {
+                    'request_id': request_id,
+                    'status': 'NOT_FOUND',
+                    'is_completed': False
+                }
+
+    except Exception as e:
+        return {
+            'error': str(e),
+            'status': 'ERROR'
+        }
+
+
 def start_procedure_async(
     secret_name: str = 'Hacienda_ERP_MSSQL_Production',
     database: str = 'Hacienda_ERP',
@@ -210,8 +375,10 @@ def start_procedure_async(
     test_mode: bool = False
 ) -> Dict:
     """
-    Start the stored procedure asynchronously (fire and forget).
-    This is used by Step Functions - it starts the procedure but doesn't wait.
+    Start the stored procedure asynchronously using the queue-based approach.
+
+    This queues a request for the server-side runner service to execute.
+    The service runs on the SQL Server with a persistent connection.
 
     Args:
         secret_name: AWS Secrets Manager secret
@@ -238,8 +405,7 @@ def start_procedure_async(
             password=conn_params['password'],
             database=conn_params['database'],
             tds_version='7.3',
-            autocommit=True,
-            timeout=0  # No timeout - procedure may take a long time
+            autocommit=True
         ) as conn:
             cursor = conn.cursor()
 
@@ -254,44 +420,44 @@ def start_procedure_async(
                 AND Status = '01-InProgress'
             """)
 
-            # Set NOCOUNT ON to prevent result set issues
-            cursor.execute("SET NOCOUNT ON")
+            # Create queue table if it doesn't exist
+            cursor.execute("""
+                IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'PROCEDURE_RUN_QUEUE')
+                BEGIN
+                    CREATE TABLE dbo.PROCEDURE_RUN_QUEUE (
+                        RequestID INT IDENTITY(1,1) PRIMARY KEY,
+                        ProcedureName NVARCHAR(255) NOT NULL,
+                        TestExecution CHAR(1) DEFAULT 'N',
+                        Status NVARCHAR(50) DEFAULT 'PENDING',
+                        RequestedAt DATETIME DEFAULT GETDATE(),
+                        StartedAt DATETIME NULL,
+                        CompletedAt DATETIME NULL,
+                        ErrorMessage NVARCHAR(MAX) NULL,
+                        RequestedBy NVARCHAR(255) DEFAULT 'Lambda'
+                    )
+                END
+            """)
 
-            # Use Service Broker to run the procedure asynchronously
-            # This creates a conversation that will execute independently of this connection
-            try:
-                # First try using a background execution wrapper if it exists
-                cursor.execute(f"""
-                    DECLARE @cmd NVARCHAR(MAX) = 'EXEC dbo.{procedure} @test_execution = ''{test_flag}'''
-                    EXEC sp_executesql @cmd
-                """)
-            except Exception as e:
-                print(f"DEBUG: sp_executesql failed, trying direct exec: {e}")
-                # Fallback to direct execution
-                cursor.execute(f"EXEC dbo.{procedure} @test_execution = %s", (test_flag,))
+            # Insert the procedure request into the queue
+            cursor.execute("""
+                INSERT INTO dbo.PROCEDURE_RUN_QUEUE (ProcedureName, TestExecution, RequestedBy)
+                OUTPUT INSERTED.RequestID
+                VALUES (%s, %s, 'Lambda-StepFunctions')
+            """, (procedure, test_flag))
 
-            # Consume any immediate results
-            try:
-                cursor.fetchall()
-            except:
-                pass
-
-            # Give the procedure a moment to register in RUN_INTF_STATUS
-            import time
-            time.sleep(3)
-
-            # Verify the procedure started by checking RUN_INTF_STATUS
-            cursor.execute("SELECT TOP 1 Status FROM dbo.RUN_INTF_STATUS ORDER BY Instance DESC")
-            status_row = cursor.fetchone()
-            started_status = status_row[0] if status_row else None
-            print(f"DEBUG: Procedure start status check: {started_status}")
+            row = cursor.fetchone()
+            request_id = row[0] if row else None
+            print(f"DEBUG: Queued procedure request with ID: {request_id}")
 
             return {
                 'started': True,
+                'queued': True,
+                'request_id': request_id,
                 'procedure': procedure,
                 'test_mode': test_mode,
                 'database': database,
-                'started_at': datetime.now().isoformat()
+                'started_at': datetime.now().isoformat(),
+                'message': 'Request queued for server-side runner. Install procedure_runner_service.py on SQL Server.'
             }
 
     except Exception as e:
@@ -308,32 +474,65 @@ def check_procedure_status(
 ) -> Dict:
     """
     Check the status of a running stored procedure.
-    This is a wrapper for get_procedure_status with the expected output format.
+    Checks both the queue status and the RUN_INTF_STATUS table.
 
     Returns:
         Dict with is_completed, status, current_step, steps_completed, delta_counts
     """
     result = get_procedure_status(secret_name, database)
 
+    # Also check queue status
+    queue_status = check_queue_status(secret_name, database)
+
     run_status = result.get('run_status', {}) or {}
     # get_run_status returns 'status' field
     status_code = str(run_status.get('status', '') or '')
     instance = run_status.get('instance')
 
-    # Determine if completed - check for completion in status string
+    # Check queue first - if queue shows completed/failed, use that
+    if queue_status.get('is_completed'):
+        return {
+            'is_completed': True,
+            'status': 'completed',
+            'current_step': None,
+            'run_status_raw': status_code,
+            'queue_status': queue_status.get('status'),
+            'instance': instance,
+            'steps_completed': result.get('steps_completed', []),
+            'delta_counts': result.get('delta_counts', {}),
+            'database': database
+        }
+
+    if queue_status.get('is_failed'):
+        return {
+            'is_completed': False,
+            'status': 'error',
+            'error_message': queue_status.get('error_message'),
+            'current_step': None,
+            'run_status_raw': status_code,
+            'queue_status': queue_status.get('status'),
+            'instance': instance,
+            'steps_completed': result.get('steps_completed', []),
+            'delta_counts': result.get('delta_counts', {}),
+            'database': database
+        }
+
+    # Fallback to RUN_INTF_STATUS check
     # Status values: "01-Running", "02-Completed", etc.
     is_completed = (
         '02' in status_code or
         'completed' in status_code.lower() or
-        'complete' in status_code.lower()
+        'complete' in status_code.lower() or
+        '03' in status_code  # 03-File Sent means completed
     )
     is_error = 'error' in status_code.lower() or 'fail' in status_code.lower()
 
     return {
         'is_completed': is_completed,
         'status': 'error' if is_error else ('completed' if is_completed else 'running'),
-        'current_step': None,  # Not available in RUN_INTF_STATUS
+        'current_step': None,
         'run_status_raw': status_code,
+        'queue_status': queue_status.get('status', 'UNKNOWN'),
         'instance': instance,
         'steps_completed': result.get('steps_completed', []),
         'delta_counts': result.get('delta_counts', {}),
