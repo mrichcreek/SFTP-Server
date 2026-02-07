@@ -86,11 +86,12 @@ def get_run_status(cursor) -> Optional[Dict]:
     Get the latest execution status from RUN_INTF_STATUS table.
 
     Returns:
-        Dict with Instance, Status, DateStarted, DateCompleted or None
+        Dict with Instance, Status or None
     """
     try:
+        # Use same query as desktop app - only Instance and Status columns are guaranteed
         cursor.execute("""
-            SELECT TOP 1 Instance, Status, DateStarted, DateCompleted
+            SELECT TOP 1 Instance, Status
             FROM dbo.RUN_INTF_STATUS
             ORDER BY Instance DESC
         """)
@@ -98,12 +99,11 @@ def get_run_status(cursor) -> Optional[Dict]:
         if row:
             return {
                 'instance': row[0],
-                'status': row[1],
-                'date_started': str(row[2]) if row[2] else None,
-                'date_completed': str(row[3]) if row[3] else None
+                'status': row[1]
             }
-    except Exception:
-        pass
+    except Exception as e:
+        # Log the error for debugging
+        print(f"Error getting run status: {e}")
     return None
 
 
@@ -272,17 +272,25 @@ def check_procedure_status(
     result = get_procedure_status(secret_name, database)
 
     run_status = result.get('run_status', {}) or {}
-    status_code = run_status.get('run_status', '') or ''
+    # get_run_status returns 'status' field
+    status_code = str(run_status.get('status', '') or '')
+    instance = run_status.get('instance')
 
-    # Determine if completed
-    is_completed = status_code == '02-Completed'
+    # Determine if completed - check for completion in status string
+    # Status values: "01-Running", "02-Completed", etc.
+    is_completed = (
+        '02' in status_code or
+        'completed' in status_code.lower() or
+        'complete' in status_code.lower()
+    )
     is_error = 'error' in status_code.lower() or 'fail' in status_code.lower()
 
     return {
         'is_completed': is_completed,
         'status': 'error' if is_error else ('completed' if is_completed else 'running'),
-        'current_step': run_status.get('current_step'),
+        'current_step': None,  # Not available in RUN_INTF_STATUS
         'run_status_raw': status_code,
+        'instance': instance,
         'steps_completed': result.get('steps_completed', []),
         'delta_counts': result.get('delta_counts', {}),
         'database': database
