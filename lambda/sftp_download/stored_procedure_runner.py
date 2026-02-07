@@ -67,8 +67,10 @@ def get_proc_trace_log(cursor, limit: int = 100) -> List[Dict]:
             ORDER BY COALESCE(timestamp, GETDATE()) DESC
         """)
         rows = cursor.fetchall()
+        print(f"DEBUG get_proc_trace_log: found {len(rows)} rows")
         return [{'step': row[0], 'timestamp': str(row[1])} for row in rows]
     except Exception as e:
+        print(f"DEBUG get_proc_trace_log error (trying without timestamp): {e}")
         # Table might not have timestamp column or might not exist
         try:
             cursor.execute(f"""
@@ -76,8 +78,10 @@ def get_proc_trace_log(cursor, limit: int = 100) -> List[Dict]:
                 FROM dbo.ProcTrace
             """)
             rows = cursor.fetchall()
+            print(f"DEBUG get_proc_trace_log (no timestamp): found {len(rows)} rows")
             return [{'step': row[0], 'timestamp': None} for row in rows]
-        except Exception:
+        except Exception as e2:
+            print(f"DEBUG get_proc_trace_log complete failure: {e2}")
             return []
 
 
@@ -96,11 +100,14 @@ def get_run_status(cursor) -> Optional[Dict]:
             ORDER BY Instance DESC
         """)
         row = cursor.fetchone()
+        print(f"DEBUG get_run_status: row={row}")
         if row:
             return {
                 'instance': row[0],
                 'status': row[1]
             }
+        else:
+            print("DEBUG get_run_status: No rows in RUN_INTF_STATUS")
     except Exception as e:
         # Log the error for debugging
         print(f"Error getting run status: {e}")
