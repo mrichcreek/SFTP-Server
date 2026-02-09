@@ -260,3 +260,72 @@ class SqlServerLoader:
                 })
 
         return results
+
+    def load_file(
+        self,
+        s3_key: str,
+        database: str = None,
+        drop_existing: bool = False
+    ) -> Dict:
+        """
+        Load a single file to SQL Server.
+
+        Args:
+            s3_key: S3 key of the file to load
+            database: Target database name (optional, uses default if not specified)
+            drop_existing: Whether to clear existing data
+
+        Returns:
+            Dict with load result including success, table_name, rows_loaded
+        """
+        # Extract filename from s3_key
+        filename = s3_key.split('/')[-1]
+
+        # Get table name from filename
+        table_name = get_table_name_from_filename(filename)
+        if not table_name:
+            return {
+                'success': False,
+                'error': f"Could not determine table name from filename: {filename}",
+                'table_name': None,
+                'rows_loaded': 0
+            }
+
+        try:
+            # Use database override if provided
+            connection_string = self.connection_string
+            if database and database != self.database_override:
+                conn_params = parse_connection_string(self.connection_string)
+                connection_string = (
+                    f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+                    f"SERVER={conn_params['server']},{conn_params.get('port', 1433)};"
+                    f"DATABASE={database};"
+                    f"UID={conn_params['user']};"
+                    f"PWD={conn_params['password']};"
+                    f"TrustServerCertificate=yes"
+                )
+
+            load_result = load_file_to_sql(
+                s3_client=self.s3_client,
+                connection_string=connection_string,
+                bucket=self.bucket,
+                s3_key=s3_key,
+                table_name=table_name,
+                filename=filename,
+                clear_existing=drop_existing
+            )
+
+            return {
+                'success': load_result.get('success', False),
+                'table_name': table_name,
+                'rows_loaded': load_result.get('rows_loaded', 0),
+                'error': load_result.get('error')
+            }
+
+        except Exception as e:
+            return {
+                'success': False,
+                'table_name': table_name,
+                'rows_loaded': 0,
+                'error': str(e)
+            }
