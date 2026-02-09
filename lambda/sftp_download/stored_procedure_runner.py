@@ -412,13 +412,18 @@ def start_procedure_async(
             # Clear ProcTrace before starting
             clear_proc_trace(cursor)
 
-            # Clear any stale RUN_INTF_STATUS
-            cursor.execute("""
-                UPDATE dbo.RUN_INTF_STATUS
-                SET Status = '00-Ready'
-                WHERE Instance = (SELECT MAX(Instance) FROM dbo.RUN_INTF_STATUS)
-                AND Status = '01-InProgress'
-            """)
+            # Try to clear any stale RUN_INTF_STATUS (wrapped in try/except in case of CHECK constraint)
+            # The SQL Agent Job's ProcessProcedureQueue also handles this, so it's not critical
+            try:
+                # Use '03-File Sent' which is a valid status value per the CHECK constraint
+                cursor.execute("""
+                    UPDATE dbo.RUN_INTF_STATUS
+                    SET Status = '03-File Sent', DateCompleted = SYSDATETIME()
+                    WHERE Instance = (SELECT MAX(Instance) FROM dbo.RUN_INTF_STATUS)
+                    AND Status IN ('01-InProgress', '02-Completed')
+                """)
+            except Exception as status_err:
+                print(f"DEBUG: Could not clear RUN_INTF_STATUS (non-fatal): {status_err}")
 
             # Create queue table if it doesn't exist
             cursor.execute("""

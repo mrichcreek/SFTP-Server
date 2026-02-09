@@ -73,10 +73,10 @@ BEGIN
         -- Table might not exist, ignore
     END CATCH
 
-    -- Reset RUN_INTF_STATUS if stuck
+    -- Reset RUN_INTF_STATUS if stuck (use '03-File Sent' which is a valid CHECK constraint value)
     BEGIN TRY
         UPDATE dbo.RUN_INTF_STATUS
-        SET Status = '00-Ready'
+        SET Status = '03-File Sent', DateCompleted = SYSDATETIME()
         WHERE Instance = (SELECT MAX(Instance) FROM dbo.RUN_INTF_STATUS)
         AND Status IN ('01-InProgress', '02-Completed')
     END TRY
