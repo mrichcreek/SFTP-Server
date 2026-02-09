@@ -81,8 +81,9 @@ def start_procedure_async(event, context):
     This is designed for Step Functions workflow:
     1. Clears any stuck status from previous runs
     2. Clears ProcTrace for fresh logging
-    3. Starts the stored procedure (fire-and-forget via connection close)
-    4. Returns immediately with start info
+    3. Inserts a request into PROCEDURE_RUN_QUEUE table
+    4. SQL Server Agent Job picks up the request and executes with persistent connection
+    5. Returns immediately with queue info
 
     Step Functions will then poll get_procedure_status() to wait for completion.
 
@@ -101,8 +102,8 @@ def start_procedure_async(event, context):
         "started_at": "2024-01-15T10:30:00",
         "database": "Hacienda_ERP",
         "test_execution": "N",
-        "status": "started",
-        "status_cleared": {...}
+        "status": "queued",
+        "request_id": 123
     }
     """
     import pyodbc
@@ -117,6 +118,12 @@ def start_procedure_async(event, context):
         sql_secret = body.get('sql_secret', os.environ.get('SQL_SECRET_NAME', 'Hacienda_ERP_MSSQL_Production'))
         database = body.get('database', 'Hacienda_ERP')
         test_execution = body.get('test_execution', 'N')
+
+        # Normalize test_execution to single char
+        if isinstance(test_execution, bool):
+            test_execution = 'Y' if test_execution else 'N'
+        elif isinstance(test_execution, str):
+            test_execution = 'Y' if test_execution.upper() in ('Y', 'YES', 'TRUE', '1') else 'N'
 
         # Get connection string from Secrets Manager
         connection_string = get_aws_secret(sql_secret)
@@ -155,22 +162,42 @@ def start_procedure_async(event, context):
         # Clear ProcTrace for fresh logging
         clear_proc_trace(cursor)
 
-        # Start the stored procedure
-        # Using a short timeout - we don't want to wait for completion
-        try:
-            cursor.execute(f"EXEC dbo.HCM_MAIN_INTF @test_execution = '{test_execution}'")
-            # Don't wait for results - close connection and let procedure run
-        except Exception as proc_start_error:
-            # Check if it's just a timeout (expected) or actual error
-            error_str = str(proc_start_error).lower()
-            if 'timeout' not in error_str:
-                result['warning'] = f"Procedure start returned: {str(proc_start_error)}"
+        # Create queue table if it doesn't exist
+        cursor.execute("""
+            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'PROCEDURE_RUN_QUEUE')
+            BEGIN
+                CREATE TABLE dbo.PROCEDURE_RUN_QUEUE (
+                    RequestID INT IDENTITY(1,1) PRIMARY KEY,
+                    ProcedureName NVARCHAR(255) NOT NULL,
+                    TestExecution CHAR(1) DEFAULT 'N',
+                    Status NVARCHAR(50) DEFAULT 'PENDING',
+                    RequestedAt DATETIME DEFAULT GETDATE(),
+                    StartedAt DATETIME NULL,
+                    CompletedAt DATETIME NULL,
+                    ErrorMessage NVARCHAR(MAX) NULL,
+                    RequestedBy NVARCHAR(255) DEFAULT 'Lambda'
+                )
+            END
+        """)
+
+        # Insert procedure request into queue
+        # SQL Server Agent Job will pick this up and execute with persistent connection
+        cursor.execute("""
+            INSERT INTO dbo.PROCEDURE_RUN_QUEUE (ProcedureName, TestExecution, RequestedBy)
+            VALUES (?, ?, 'Lambda-StepFunctions')
+        """, ('HCM_MAIN_INTF', test_execution))
+
+        # Get the request ID
+        cursor.execute("SELECT SCOPE_IDENTITY()")
+        row = cursor.fetchone()
+        request_id = int(row[0]) if row and row[0] else None
 
         cursor.close()
         conn.close()
 
-        result['status'] = 'started'
-        result['message'] = 'Stored procedure started. Poll status endpoint to track progress.'
+        result['status'] = 'queued'
+        result['request_id'] = request_id
+        result['message'] = 'Procedure request queued. SQL Server Agent Job will execute. Poll status endpoint to track progress.'
 
         # For Step Functions direct invoke, return result directly
         if 'body' not in event:
