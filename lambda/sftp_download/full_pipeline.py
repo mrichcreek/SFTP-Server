@@ -277,9 +277,10 @@ class FullPipelineOrchestrator:
             # Step 1: Duplicate Check
             try:
                 dup_result = detect_and_move_duplicates(
-                    self.bucket,
-                    initial_folder,
-                    folders['invalid']  # Move duplicates to invalid folder
+                    prefix=initial_folder,
+                    bucket=self.bucket,
+                    auto_move=True,
+                    destination_folder=folders['invalid']  # Move duplicates to invalid folder
                 )
                 results['duplicate_check'] = {
                     'success': True,
