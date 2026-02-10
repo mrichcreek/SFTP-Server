@@ -52,6 +52,7 @@ try:
     from .delta_exporter import DeltaExporter
     from .sftp_uploader import SftpUploader
     from .sftp_downloader import SftpDownloader, download_from_sftp
+    from .report_generator import get_report_url_handler
 except ImportError:
     from sftp_download.duplicate_detector import detect_and_move_duplicates
     from sftp_download.completeness_checker import (
@@ -69,6 +70,7 @@ except ImportError:
     from sftp_download.delta_exporter import DeltaExporter
     from sftp_download.sftp_uploader import SftpUploader
     from sftp_download.sftp_downloader import SftpDownloader, download_from_sftp
+    from sftp_download.report_generator import get_report_url_handler
 
 
 class PipelineStep(Enum):
@@ -2299,6 +2301,31 @@ def pipeline_step_handler(event, context):
             sftp_secret = event.get('sftp_secret', 'Sterling_SFTP_Direct_Production')
             remote_folder = event.get('remote_folder', '/GPR/HCM')
 
+            # Clean up downloads folder before starting new download
+            # This prevents old files from previous runs being included
+            s3_client = boto3.client('s3')
+            try:
+                paginator = s3_client.get_paginator('list_objects_v2')
+                objects_to_delete = []
+                for page in paginator.paginate(Bucket=bucket, Prefix='downloads/'):
+                    for obj in page.get('Contents', []):
+                        # Only delete files, not folders
+                        if not obj['Key'].endswith('/'):
+                            objects_to_delete.append({'Key': obj['Key']})
+
+                # Delete in batches of 1000 (S3 limit)
+                if objects_to_delete:
+                    for i in range(0, len(objects_to_delete), 1000):
+                        batch = objects_to_delete[i:i+1000]
+                        s3_client.delete_objects(
+                            Bucket=bucket,
+                            Delete={'Objects': batch}
+                        )
+                    result['cleaned_files'] = len(objects_to_delete)
+            except Exception as e:
+                # Log but don't fail if cleanup fails
+                result['cleanup_warning'] = f'Failed to clean downloads folder: {str(e)}'
+
             try:
                 from .sftp_downloader import download_from_sftp
             except ImportError:
@@ -2632,6 +2659,9 @@ def get_pipeline_status_handler(event, context):
     API Gateway handler to get Step Functions execution status.
 
     GET /pipeline-status/{executionId}
+
+    Returns step_details with accumulated state containing all results
+    (sftpDownloadResult, validationResult, sqlLoadResult, procStatus, etc.)
     """
     try:
         # Get execution ID from path parameters
@@ -2653,24 +2683,33 @@ def get_pipeline_status_handler(event, context):
         import urllib.parse
         execution_id = urllib.parse.unquote(execution_id)
 
+        # Convert execution name to full ARN if needed
+        if not execution_id.startswith('arn:'):
+            # Extract state machine name from STATE_MACHINE_ARN
+            sm_arn_parts = STATE_MACHINE_ARN.split(':')
+            # Build execution ARN: arn:aws:states:region:account:execution:stateMachineName:executionName
+            execution_arn = f"arn:aws:states:{sm_arn_parts[3]}:{sm_arn_parts[4]}:execution:{sm_arn_parts[6]}:{execution_id}"
+        else:
+            execution_arn = execution_id
+
         sfn_client = boto3.client('stepfunctions')
 
         # Get execution details
-        execution = sfn_client.describe_execution(executionArn=execution_id)
+        execution = sfn_client.describe_execution(executionArn=execution_arn)
 
         # Get execution history to determine current step
         history = sfn_client.get_execution_history(
-            executionArn=execution_id,
-            maxResults=100,
-            reverseOrder=True
+            executionArn=execution_arn,
+            maxResults=200,
+            reverseOrder=False  # Chronological order to get accumulated state
         )
 
         # Parse current state and step details
         current_step = None
-        completed_steps = []
-        step_details = {}
+        completed_states = []
+        latest_state_data = {}  # Will contain the most recent accumulated state
 
-        for event_item in reversed(history['events']):
+        for event_item in history['events']:
             event_type = event_item['type']
 
             if event_type == 'TaskStateEntered':
@@ -2679,27 +2718,57 @@ def get_pipeline_status_handler(event, context):
                     current_step = state_name
 
             elif event_type == 'TaskStateExited':
-                state_name = event_item.get('stateExitedEventDetails', {}).get('name')
-                output = event_item.get('stateExitedEventDetails', {}).get('output')
-                if state_name and state_name not in completed_steps:
-                    completed_steps.append(state_name)
+                state_details = event_item.get('stateExitedEventDetails', {})
+                state_name = state_details.get('name')
+                output = state_details.get('output')
+                if state_name and state_name not in completed_states:
+                    completed_states.append(state_name)
+                    # Parse the accumulated state output
                     if output:
                         try:
-                            step_details[state_name] = json.loads(output)
+                            latest_state_data = json.loads(output)
                         except:
-                            step_details[state_name] = {'raw': output[:500]}
+                            pass
+
+            elif event_type == 'WaitStateEntered':
+                state_name = event_item.get('stateEnteredEventDetails', {}).get('name')
+                if state_name:
+                    current_step = state_name
+
+            elif event_type == 'WaitStateExited':
+                state_details = event_item.get('stateExitedEventDetails', {})
+                output = state_details.get('output')
+                if output:
+                    try:
+                        latest_state_data = json.loads(output)
+                    except:
+                        pass
+
+            elif event_type == 'ChoiceStateEntered':
+                state_details = event_item.get('stateEnteredEventDetails', {})
+                state_name = state_details.get('name')
+                if state_name:
+                    current_step = state_name
+                    # Get input data which contains accumulated state
+                    input_str = state_details.get('input')
+                    if input_str:
+                        try:
+                            latest_state_data = json.loads(input_str)
+                        except:
+                            pass
 
             elif event_type == 'ExecutionFailed':
                 error = event_item.get('executionFailedEventDetails', {})
-                step_details['error'] = error
+                latest_state_data['_error'] = error
 
-        # Build response
+        # Build response with step_details containing the accumulated state
+        # This includes sftpDownloadResult, folderResult, validationResult, etc.
         result = {
             'execution_id': execution_id,
             'status': execution['status'],
             'current_step': current_step,
-            'completed_steps': completed_steps,
-            'step_details': step_details,
+            'completed_states': completed_states,
+            'step_details': latest_state_data,  # Contains all accumulated results
             'started_at': execution['startDate'].isoformat() if execution.get('startDate') else None,
             'stopped_at': execution.get('stopDate').isoformat() if execution.get('stopDate') else None
         }
@@ -2708,7 +2777,10 @@ def get_pipeline_status_handler(event, context):
         if execution['status'] in ['SUCCEEDED', 'FAILED', 'ABORTED']:
             if execution.get('output'):
                 try:
-                    result['output'] = json.loads(execution['output'])
+                    output_data = json.loads(execution['output'])
+                    result['output'] = output_data
+                    # Use final output as step_details for completed executions
+                    result['step_details'] = output_data
                 except:
                     result['output'] = execution['output']
             if execution.get('error'):
@@ -2727,16 +2799,17 @@ def get_pipeline_status_handler(event, context):
             'body': json.dumps(result)
         }
 
-    except sfn_client.exceptions.ExecutionDoesNotExist:
-        return {
-            'statusCode': 404,
-            'headers': {
-                'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
-            },
-            'body': json.dumps({'error': 'Execution not found'})
-        }
     except Exception as e:
+        error_msg = str(e)
+        if 'ExecutionDoesNotExist' in error_msg or 'does not exist' in error_msg.lower():
+            return {
+                'statusCode': 404,
+                'headers': {
+                    'Content-Type': 'application/json',
+                    'Access-Control-Allow-Origin': '*'
+                },
+                'body': json.dumps({'error': 'Execution not found'})
+            }
         import traceback
         return {
             'statusCode': 500,
@@ -2907,6 +2980,8 @@ def api_router_handler(event, context):
         return stop_pipeline_handler(event, context)
     elif path == '/pipeline-folders':
         return get_pipeline_folders_handler(event, context)
+    elif path == '/get-report-url':
+        return get_report_url_handler(event, context)
     else:
         # Fall back to the step handler for Step Functions calls
         return pipeline_step_handler(event, context)
