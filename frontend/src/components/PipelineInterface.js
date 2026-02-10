@@ -741,8 +741,13 @@ function PipelineInterface() {
       // Extract Stored Procedure results
       const procStartResult = detailsData.procStartResult;
       const procStatus = detailsData.procStatus;
+      // Check if procedure failed
+      const isProcFailed = completedStates.has('ProcedureFailed') ||
+                           procStatus?.status === 'error' ||
+                           (status.status === 'FAILED' && completedStates.has('CheckProcedureStatus'));
+
       if (procStartResult || procStatus) {
-        const isRunning = procStatus && !procStatus.is_completed && procStatus.status !== 'error';
+        const isRunning = procStatus && !procStatus.is_completed && procStatus.status !== 'error' && !isProcFailed;
         const isCompleted = procStatus?.is_completed || false;
         const startTime = procStartResult?.timestamp ? new Date(procStartResult.timestamp) : null;
         const procDuration = startTime ? Math.round((new Date() - startTime) / 1000) : 0;
@@ -759,35 +764,39 @@ function PipelineInterface() {
         }));
 
         // Determine substep statuses progressively
-        const personStatus = isProcStartDone ? 'pass' : (procStartResult ? 'in progress' : 'pending');
-        const businessStatus = isCompleted ? 'pass' : (isRunning ? 'in progress' : 'pending');
-        const summaryStatus = isCompleted ? 'pass' : 'pending';
+        const personStatus = isProcFailed ? 'fail' : (isProcStartDone ? 'pass' : (procStartResult ? 'in progress' : 'pending'));
+        const businessStatus = isProcFailed ? 'fail' : (isCompleted ? 'pass' : (isRunning ? 'in progress' : 'pending'));
+        const summaryStatus = isProcFailed ? 'fail' : (isCompleted ? 'pass' : 'pending');
+
+        // Get error message if available
+        const errorMessage = detailsData.errorReport?.message || procStatus?.error || detailsData._error?.cause;
 
         newStepData.stored_procedure = {
-          status: isCompleted ? 'pass' : (isRunning || isProcStartDone ? 'in progress' : 'pending'),
+          status: isProcFailed ? 'fail' : (isCompleted ? 'pass' : (isRunning || isProcStartDone ? 'in progress' : 'pending')),
           duration: procDuration,
           currentStep: procStatus?.current_step || procStatus?.status || 'running',
           deltaCounts: deltaCounts,
           totalDeltas: totalDeltas,
+          errorMessage: errorMessage,
           subTasks: {
             person: {
               status: personStatus,
-              message: personStatus === 'pass' ? 'PERSON hierarchy updated' : 'Processing records...'
+              message: personStatus === 'fail' ? 'Error during processing' : (personStatus === 'pass' ? 'PERSON hierarchy updated' : 'Processing records...')
             },
             business: {
               status: businessStatus,
-              message: totalDeltas > 0 ? `${totalDeltas} delta records generated` : (isRunning ? 'Validating business rules...' : 'Waiting...'),
+              message: isProcFailed ? (errorMessage || 'Procedure failed') : (totalDeltas > 0 ? `${totalDeltas} delta records generated` : (isRunning ? 'Validating business rules...' : 'Waiting...')),
               count: totalDeltas,
               files: deltaFiles,
               isExpanded: getExpandedState('stored_procedure', 'business')
             },
             summary: {
               status: summaryStatus,
-              message: isCompleted ? 'Summary tables generated' : 'Waiting...'
+              message: isProcFailed ? 'Not completed' : (isCompleted ? 'Summary tables generated' : 'Waiting...')
             }
           }
         };
-      } else if (['StartStoredProcedure', 'WaitForProcedure', 'CheckProcedureStatus'].includes(status.current_step)) {
+      } else if (['StartStoredProcedure', 'WaitForProcedure', 'CheckProcedureStatus', 'ProcedureFailed'].includes(status.current_step)) {
         newStepData.stored_procedure = {
           status: 'in progress',
           duration: 0,
@@ -911,7 +920,16 @@ function PipelineInterface() {
         setOverallProgress(100);
         stopPolling();
       } else if (status.status === 'FAILED' || status.status === 'TIMED_OUT' || status.status === 'ABORTED') {
-        setError(status.error || status.cause || 'Pipeline failed');
+        // Try to get a more descriptive error message
+        let errorMsg = status.error || status.cause || 'Pipeline failed';
+        if (detailsData._error?.cause) {
+          errorMsg = detailsData._error.cause;
+        } else if (detailsData.procStatus?.status === 'error') {
+          errorMsg = `Stored procedure failed: ${detailsData.procStatus.error || 'Unknown error'}`;
+        } else if (detailsData.errorReport?.message) {
+          errorMsg = detailsData.errorReport.message;
+        }
+        setError(errorMsg);
         stopPolling();
       }
     } catch (err) {
