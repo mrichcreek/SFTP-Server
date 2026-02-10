@@ -693,23 +693,29 @@ function PipelineInterface() {
 
       // Extract SQL Load results
       const sqlLoadResult = detailsData.sqlLoadResult;
-      if (sqlLoadResult) {
+      if (sqlLoadResult || isSqlLoadDone) {
         // Separate files by source (RHUM vs HACIENDA/FIMAS)
-        const loadResults = sqlLoadResult.load_results || [];
+        const loadResults = sqlLoadResult?.load_results || [];
         const rhumFiles = loadResults.filter(f => f.filename?.toLowerCase().includes('rhum'));
         const haciendaFiles = loadResults.filter(f => !f.filename?.toLowerCase().includes('rhum'));
 
+        // Determine success: explicit success property, or infer from tables_created/files_loaded
+        const tablesLoaded = sqlLoadResult?.tables_created || sqlLoadResult?.files_loaded || 0;
+        const hasExplicitSuccess = sqlLoadResult?.success !== undefined;
+        const isSuccess = hasExplicitSuccess ? sqlLoadResult.success : (tablesLoaded > 0 || isSqlLoadDone);
+
         newStepData.sql_load = {
-          status: isSqlLoadDone ? (sqlLoadResult.success ? 'pass' : 'fail') : 'in progress',
+          status: isSqlLoadDone ? (isSuccess ? 'pass' : 'fail') : 'in progress',
           duration: 0,
-          filesProcessed: sqlLoadResult.files_processed || 0,
-          filesLoaded: sqlLoadResult.files_loaded || 0,
-          totalRows: sqlLoadResult.total_rows || 0,
-          reportKey: sqlLoadResult.report_key,
+          filesProcessed: sqlLoadResult?.files_processed || 0,
+          filesLoaded: sqlLoadResult?.files_loaded || tablesLoaded,
+          totalRows: sqlLoadResult?.total_rows || 0,
+          reportKey: sqlLoadResult?.report_key,
           subTasks: {
             rhum: {
               status: rhumFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
               count: rhumFiles.length,
+              message: rhumFiles.length > 0 ? `${rhumFiles.length} tables` : undefined,
               files: rhumFiles.map(f => ({
                 name: f.filename,
                 status: f.success ? 'completed' : 'failed'
@@ -719,6 +725,7 @@ function PipelineInterface() {
             hacienda: {
               status: haciendaFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
               count: haciendaFiles.length,
+              message: haciendaFiles.length > 0 ? `${haciendaFiles.length} tables` : undefined,
               files: haciendaFiles.map(f => ({
                 name: f.filename,
                 status: f.success ? 'completed' : 'failed'
@@ -810,26 +817,37 @@ function PipelineInterface() {
 
       // Extract Delta Export results
       const exportResult = detailsData.exportResult;
-      if (exportResult) {
-        const exportedFiles = exportResult.exported_files || [];
-        const rhumExports = exportedFiles.filter(f => f.toLowerCase().includes('rhum'));
-        const haciendaExports = exportedFiles.filter(f => !f.toLowerCase().includes('rhum'));
+      if (exportResult || isExportDone) {
+        // Handle both 'exported_files' (array of paths) and 'files_exported' (array of objects)
+        const exportedFiles = exportResult?.exported_files ||
+                              (exportResult?.files_exported || []).map(f => f.s3_key || f.filename || f);
+        const rhumExports = exportedFiles.filter(f => (typeof f === 'string' ? f : '').toLowerCase().includes('rhum'));
+        const haciendaExports = exportedFiles.filter(f => !(typeof f === 'string' ? f : '').toLowerCase().includes('rhum'));
+
+        // Determine success: explicit success property, or infer from files exported
+        const filesExported = exportResult?.total_files || exportedFiles.length || 0;
+        const hasExplicitSuccess = exportResult?.success !== undefined;
+        const isSuccess = hasExplicitSuccess ? exportResult.success : (filesExported > 0 || isExportDone);
 
         newStepData.delta_export = {
-          status: isExportDone ? (exportResult.success ? 'pass' : 'fail') : 'in progress',
+          status: isExportDone ? (isSuccess ? 'pass' : 'fail') : 'in progress',
           duration: 0,
-          outputPrefix: exportResult.output_prefix,
+          outputPrefix: exportResult?.output_prefix,
+          totalFiles: filesExported,
+          totalRows: exportResult?.total_rows || 0,
           subTasks: {
             rhum: {
               status: rhumExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
               count: rhumExports.length,
-              files: rhumExports.map(f => ({ name: f.split('/').pop(), status: 'completed' })),
+              message: rhumExports.length > 0 ? `${rhumExports.length} files` : undefined,
+              files: rhumExports.map(f => ({ name: (typeof f === 'string' ? f.split('/').pop() : f), status: 'completed' })),
               isExpanded: getExpandedState('delta_export', 'rhum')
             },
             hacienda: {
               status: haciendaExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
               count: haciendaExports.length,
-              files: haciendaExports.map(f => ({ name: f.split('/').pop(), status: 'completed' })),
+              message: haciendaExports.length > 0 ? `${haciendaExports.length} files` : undefined,
+              files: haciendaExports.map(f => ({ name: (typeof f === 'string' ? f.split('/').pop() : f), status: 'completed' })),
               isExpanded: getExpandedState('delta_export', 'hacienda')
             }
           }
@@ -900,9 +918,9 @@ function PipelineInterface() {
       console.log('=== Calculated Step Data ===');
       console.log('sftp_download status:', newStepData.sftp_download?.status);
       console.log('validation status:', newStepData.validation?.status);
-      console.log('sql_load status:', newStepData.sql_load?.status);
+      console.log('sql_load status:', newStepData.sql_load?.status, '| sqlLoadResult:', sqlLoadResult ? 'exists' : 'missing', '| isSqlLoadDone:', isSqlLoadDone);
       console.log('stored_procedure status:', newStepData.stored_procedure?.status);
-      console.log('delta_export status:', newStepData.delta_export?.status);
+      console.log('delta_export status:', newStepData.delta_export?.status, '| exportResult:', exportResult ? 'exists' : 'missing', '| isExportDone:', isExportDone);
       console.log('generate_report status:', newStepData.generate_report?.status);
 
       // Calculate progress based on completed steps
