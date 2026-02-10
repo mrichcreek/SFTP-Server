@@ -331,12 +331,14 @@ class DeltaExporter:
             cursor.close()
             conn.close()
 
-    def export_all(self, update_status: bool = True) -> Dict:
+    def export_all(self, update_status: bool = True, force_export: bool = True) -> Dict:
         """
         Export all delta views to S3.
 
         Args:
             update_status: Whether to update RUN_INTF_STATUS after export
+            force_export: If True, export even if status is not '02-Completed'
+                         (exports the latest delta files regardless of status)
 
         Returns:
             Dict with export results
@@ -349,14 +351,16 @@ class DeltaExporter:
             'errors': []
         }
 
-        # Check if ready for export
+        # Check status but don't block export if force_export is True
         status_check = self.check_status()
-        if not status_check.get('ready'):
+        instance = status_check.get('instance')
+        result['instance'] = instance
+        result['current_status'] = status_check.get('status', 'unknown')
+
+        # Only block if not forcing and status isn't ready
+        if not force_export and not status_check.get('ready'):
             result['error'] = f"Not ready for export. Status: {status_check.get('status', 'unknown')}"
             return result
-
-        instance = status_check['instance']
-        result['instance'] = instance
 
         try:
             # Get views to export
@@ -469,7 +473,7 @@ def export_handler(event, context):
         bucket = body.get('s3_bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
 
         # Build output prefix with folder structure
-        output_prefix = f"{folder}/7_Export_Files/"
+        output_prefix = f"{folder}/6_Delta_Files/"
 
         exporter = DeltaExporter(
             bucket=bucket,
