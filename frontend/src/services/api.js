@@ -496,3 +496,25 @@ export async function listPipelineExecutions(maxResults = 10) {
 
   return response.json();
 }
+
+/**
+ * Get a pre-signed URL for downloading a report from S3
+ * @param {string} reportKey - The S3 key of the report file
+ * @returns {Promise} Pre-signed URL for download
+ */
+export async function getReportDownloadUrl(reportKey) {
+  const headers = await getAuthHeaders();
+
+  const response = await fetch(`${API_ENDPOINT}/get-report-url`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ report_key: reportKey })
+  });
+
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.message || 'Failed to get report URL');
+  }
+
+  return response.json();
+}
