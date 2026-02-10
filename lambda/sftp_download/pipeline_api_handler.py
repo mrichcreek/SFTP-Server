@@ -127,13 +127,13 @@ def get_pipeline_status_handler(event, context):
     {
         "executionId": "pipeline-20240115-103000",
         "status": "RUNNING" | "SUCCEEDED" | "FAILED" | "TIMED_OUT" | "ABORTED",
-        "currentStep": "SqlLoad",
+        "current_step": "SqlLoad",
         "completedSteps": 5,
         "totalSteps": 10,
         "progress": 50,
-        "startedAt": "2024-01-15T10:30:00Z",
-        "stoppedAt": null,
-        "output": {...},  // Only if completed
+        "started_at": "2024-01-15T10:30:00Z",
+        "stopped_at": null,
+        "step_details": {...},  // Detailed results from each completed step
         "error": null     // Only if failed
     }
     """
@@ -164,8 +164,8 @@ def get_pipeline_status_handler(event, context):
         # Get execution history for progress tracking
         history = sfn_client.get_execution_history(
             executionArn=job['executionArn'],
-            maxResults=100,
-            reverseOrder=True
+            maxResults=200,
+            reverseOrder=False  # Get events in chronological order
         )
 
         # Determine current step and completed steps from history
@@ -195,8 +195,10 @@ def get_pipeline_status_handler(event, context):
         }
 
         completed_states = []
-
         seen_states = set()
+        step_details = {}  # Store detailed output from each step
+
+        # Process events in chronological order
         for event_item in history['events']:
             if event_item['type'] == 'TaskStateEntered':
                 state_details = event_item.get('stateEnteredEventDetails', {})
@@ -213,16 +215,44 @@ def get_pipeline_status_handler(event, context):
                         'step': state_name,
                         'completed_at': event_item['timestamp'].isoformat()
                     })
+                    # Extract the step output to get detailed results
+                    output_str = state_details.get('output', '{}')
+                    try:
+                        output_data = json.loads(output_str)
+                        # Store the accumulated state which contains all previous step results
+                        step_details[state_name] = output_data
+                    except json.JSONDecodeError:
+                        pass
             elif event_item['type'] == 'WaitStateEntered':
                 state_details = event_item.get('stateEnteredEventDetails', {})
                 state_name = state_details.get('name', '')
                 if state_name:
                     current_step = state_name
+                    seen_states.add(state_name)
+            elif event_item['type'] == 'WaitStateExited':
+                state_details = event_item.get('stateExitedEventDetails', {})
+                state_name = state_details.get('name', '')
+                if state_name:
+                    # Extract current state data from WaitStateExited
+                    output_str = state_details.get('output', '{}')
+                    try:
+                        output_data = json.loads(output_str)
+                        step_details[state_name] = output_data
+                    except json.JSONDecodeError:
+                        pass
             elif event_item['type'] == 'ChoiceStateEntered':
                 state_details = event_item.get('stateEnteredEventDetails', {})
                 state_name = state_details.get('name', '')
                 if state_name:
                     current_step = state_name
+                    seen_states.add(state_name)
+                    # Extract input data for choice states
+                    input_str = state_details.get('input', '{}')
+                    try:
+                        input_data = json.loads(input_str)
+                        step_details[state_name] = input_data
+                    except json.JSONDecodeError:
+                        pass
 
         # Calculate completed steps based on seen states
         max_step = 0
@@ -231,8 +261,16 @@ def get_pipeline_status_handler(event, context):
                 max_step = max(max_step, step_order[state_name])
         completed_steps = max_step
 
-        total_steps = 10
+        total_steps = 8  # 8 UI steps
         progress = int((completed_steps / total_steps) * 100)
+
+        # Get the most recent step_details (which contains all accumulated state)
+        # The last task exit will have the most complete state
+        latest_step_data = {}
+        for state_name in reversed(list(step_details.keys())):
+            if step_details[state_name]:
+                latest_step_data = step_details[state_name]
+                break
 
         # Build response (including fields expected by frontend)
         result = {
@@ -240,22 +278,28 @@ def get_pipeline_status_handler(event, context):
             'executionId': execution_id,  # Legacy compatibility
             'executionArn': job['executionArn'],
             'status': execution['status'],
-            'current_state': current_step,  # Field expected by frontend
+            'current_step': current_step,  # Field expected by frontend
             'currentStep': current_step,  # Legacy compatibility
             'completed_states': list(set(completed_states)),  # Field expected by frontend
             'completedSteps': completed_steps,
             'totalSteps': total_steps,
             'progress': progress,
-            'startedAt': execution['startDate'].isoformat(),
+            'started_at': execution['startDate'].isoformat(),
+            'startedAt': execution['startDate'].isoformat(),  # Legacy
+            'stopped_at': execution.get('stopDate').isoformat() if execution.get('stopDate') else None,
             'stoppedAt': execution.get('stopDate').isoformat() if execution.get('stopDate') else None,
             'environment': job.get('environment', 'production'),
-            'test_mode': job.get('test_mode', False)
+            'test_mode': job.get('test_mode', False),
+            # Include step details for frontend to extract results
+            'step_details': latest_step_data
         }
 
         # Add output if completed
         if execution.get('output'):
             try:
                 result['output'] = json.loads(execution['output'])
+                # Also update step_details with final output
+                result['step_details'] = result['output']
             except json.JSONDecodeError:
                 result['output'] = execution['output']
 
@@ -265,7 +309,7 @@ def get_pipeline_status_handler(event, context):
             result['cause'] = execution.get('cause')
 
         # Add recent step info
-        result['recentSteps'] = steps_info[:5] if steps_info else []
+        result['recentSteps'] = steps_info[-5:] if steps_info else []
 
         # Update DynamoDB with latest status
         table.update_item(

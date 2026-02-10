@@ -307,47 +307,66 @@ def get_report_url_handler(event, context):
     """
     Lambda handler for getting a presigned URL to download a report.
 
-    Expected path parameter: report_id (the S3 key of the report)
+    POST /get-report-url
+    Body: { "report_key": "20260210_1234/reports/Downloaded Files.txt" }
+
+    Also supports legacy path parameter: report_id
     """
     import os
 
     try:
-        # Get report ID from path parameters
-        path_params = event.get('pathParameters', {}) or {}
-        report_id = path_params.get('report_id', '')
+        # Parse request body for report_key
+        if 'body' in event and event['body']:
+            body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+            report_key = body.get('report_key', '')
+        else:
+            body = {}
+            report_key = ''
 
-        if not report_id:
+        # Fallback to path parameters for legacy support
+        if not report_key:
+            path_params = event.get('pathParameters', {}) or {}
+            report_id = path_params.get('report_id', '')
+            if report_id:
+                report_key = f'reports/{report_id}'
+
+        if not report_key:
             return {
                 'statusCode': 400,
                 'headers': {
                     'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
+                    'Access-Control-Allow-Origin': '*',
+                    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
                 },
-                'body': json.dumps({'error': 'report_id is required'})
+                'body': json.dumps({'error': 'report_key is required'})
             }
 
-        bucket_name = os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads')
-        s3_key = f'reports/{report_id}'
-
+        bucket_name = body.get('bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
         s3_client = boto3.client('s3')
 
         # Check if report exists
         try:
-            s3_client.head_object(Bucket=bucket_name, Key=s3_key)
-        except s3_client.exceptions.ClientError:
-            return {
-                'statusCode': 404,
-                'headers': {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*'
-                },
-                'body': json.dumps({'error': 'Report not found'})
-            }
+            s3_client.head_object(Bucket=bucket_name, Key=report_key)
+        except Exception as e:
+            error_code = getattr(e, 'response', {}).get('Error', {}).get('Code', 'Unknown')
+            if error_code in ('404', 'NoSuchKey'):
+                return {
+                    'statusCode': 404,
+                    'headers': {
+                        'Content-Type': 'application/json',
+                        'Access-Control-Allow-Origin': '*',
+                        'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                        'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                    },
+                    'body': json.dumps({'error': f'Report not found: {report_key}'})
+                }
+            raise
 
         # Generate presigned URL
         presigned_url = s3_client.generate_presigned_url(
             'get_object',
-            Params={'Bucket': bucket_name, 'Key': s3_key},
+            Params={'Bucket': bucket_name, 'Key': report_key},
             ExpiresIn=3600
         )
 
@@ -355,11 +374,14 @@ def get_report_url_handler(event, context):
             'statusCode': 200,
             'headers': {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
             },
             'body': json.dumps({
-                'report_id': report_id,
-                'download_url': presigned_url,
+                'report_key': report_key,
+                'url': presigned_url,
+                'download_url': presigned_url,  # Legacy compatibility
                 'expires_in_seconds': 3600
             })
         }
@@ -369,7 +391,9 @@ def get_report_url_handler(event, context):
             'statusCode': 500,
             'headers': {
                 'Content-Type': 'application/json',
-                'Access-Control-Allow-Origin': '*'
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
             },
             'body': json.dumps({'error': str(e)})
         }

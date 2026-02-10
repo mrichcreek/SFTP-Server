@@ -800,6 +800,32 @@ Resources:
             Auth:
               Authorizer: CognitoAuthorizer
 
+  # API endpoint for getting report download URLs
+  GetReportUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hacienda-get-report-url-${Environment}'
+      CodeUri: ../lambda/
+      Handler: sftp_download.report_generator.get_report_url_handler
+      Runtime: python3.11
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref DownloadsBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DownloadsBucket
+      Events:
+        GetReportUrl:
+          Type: Api
+          Properties:
+            RestApiId: !Ref ApiGateway
+            Path: /get-report-url
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
   # ============================================================================
   # VPC Endpoint for S3
   # ============================================================================

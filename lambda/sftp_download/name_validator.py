@@ -54,14 +54,23 @@ SOURCE_ALIASES = {
     "ASSIGN": "PERSON_ASSIGNMENT",
     "ASSIGNMENT": "PERSON_ASSIGNMENT",
     "PERSON_ASSIGN": "PERSON_ASSIGNMENT",
+    "PERSON_ASSIGN_INTF": "PERSON_ASSIGNMENT",
     "NAME": "PERSON_NAME",
+    "PERSON_NAME_INTF": "PERSON_NAME",
     "ADDRESS": "PERSON_ADDRESS",
+    "PERSON_ADDRESS_INTF": "PERSON_ADDRESS",
     "NID": "PERSON_NID",
+    "PERSON_NID_INTF": "PERSON_NID",
     "SUPERVISOR": "PERSON_SUPERVISOR",
     "SUPV": "PERSON_SUPERVISOR",
     "PERSON_SUPV": "PERSON_SUPERVISOR",
+    "PERSON_SUPV_INTF": "PERSON_SUPERVISOR",
+    "PERSON_SUPERVISOR_INTF": "PERSON_SUPERVISOR",
     "EMAIL": "PERSON_EMAIL",
+    "PERSON_EMAIL_INTF": "PERSON_EMAIL",
+    "PERSON_INTF": "PERSON",
     "SENIOR": "SENIORITY",
+    "SENIORITY_INTF": "SENIORITY",
 }
 
 ENTITY_ALIASES = {
@@ -176,8 +185,12 @@ def extract_components(file_name: str) -> Optional[Dict]:
     """
     Extract source, entity, and date from a file name.
     Returns None if the file doesn't match expected patterns.
+
+    For files like 'hcm_person_address_rhum75_20260109.csv':
+    - Source should be 'PERSON_ADDRESS' (known source)
+    - Entity should be 'rhum75' (which normalizes to RHUM)
     """
-    # Try primary pattern first
+    # Try primary pattern first (with _INTF_)
     match = FILE_PATTERN.match(file_name)
     if match:
         return {
@@ -187,13 +200,38 @@ def extract_components(file_name: str) -> Optional[Dict]:
             "pattern": "primary"
         }
 
-    # Try alternative pattern
+    # For alternative pattern (no _INTF_), we need smarter parsing
+    # Try to match known sources from longest to shortest
     match = ALT_PATTERN.match(file_name)
     if match:
+        # Get the full middle portion (everything between HCM_ and _DATE.csv)
+        full_middle = match.group(1) + "_" + match.group(2)
+        date_str = match.group(3)
+
+        # Known sources (sorted by length, longest first to match greedily)
+        known_sources = sorted(VALID_SOURCES + list(SOURCE_ALIASES.keys()), key=len, reverse=True)
+
+        upper_middle = full_middle.upper()
+
+        # Try to find a known source at the start
+        for source in known_sources:
+            # Check if middle starts with this source followed by underscore
+            if upper_middle.startswith(source + "_"):
+                # Found the source, the rest is the entity
+                entity = full_middle[len(source) + 1:]  # Skip source and underscore
+                return {
+                    "source": source,
+                    "entity": entity,
+                    "date": date_str,
+                    "pattern": "alternative_smart"
+                }
+
+        # If no known source found, fall back to original behavior
+        # (first part is source, rest is entity)
         return {
             "source": match.group(1),
             "entity": match.group(2),
-            "date": match.group(3),
+            "date": date_str,
             "pattern": "alternative"
         }
 

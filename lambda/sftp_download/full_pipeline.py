@@ -308,16 +308,49 @@ class FullPipelineOrchestrator:
                 validation_results = name_result.get('results', [])
                 # ValidationResult has is_valid attribute, not 'valid' key
                 invalid_names = [r for r in validation_results if not r.is_valid]
+                valid_names = [r for r in validation_results if r.is_valid]
+
                 results['name_validation'] = {
                     'success': len(invalid_names) == 0,
                     'files_checked': len(file_list),
                     'invalid_count': len(invalid_names),
+                    'valid_count': len(valid_names),
                     'invalid_files': [{'file_name': r.file_name, 'error': r.error_message} for r in invalid_names[:10]]
                 }
 
+                # Move invalid name files to invalid folder
                 if invalid_names:
-                    results['has_critical_errors'] = True
+                    invalid_filenames = {r.file_name for r in invalid_names}
+                    files_by_name = {f['filename']: f for f in files}
+
+                    for invalid_result in invalid_names:
+                        file_info = files_by_name.get(invalid_result.file_name)
+                        source_key = file_info.get('s3_key') if file_info else None
+                        if source_key:
+                            filename = source_key.split('/')[-1]
+                            dest_key = f"{folders['invalid']}/{filename}"
+                            try:
+                                self.s3_client.copy_object(
+                                    Bucket=self.bucket,
+                                    CopySource={'Bucket': self.bucket, 'Key': source_key},
+                                    Key=dest_key
+                                )
+                                self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
+                                results['invalid_files'].append({
+                                    'filename': filename,
+                                    'reason': 'name_invalid',
+                                    'error': invalid_result.error_message
+                                })
+                            except Exception:
+                                pass
+
+                    # Re-list files after moving invalid ones
+                    files = self._list_initial_files(initial_folder)
                     results['all_passed'] = False
+
+                    # Only critical if ALL files had invalid names
+                    if len(valid_names) == 0:
+                        results['has_critical_errors'] = True
 
             except Exception as e:
                 results['name_validation'] = {
@@ -387,9 +420,13 @@ class FullPipelineOrchestrator:
                 completeness = check_file_completeness(file_list)
 
                 # CompletenessResult is a dataclass, access attributes directly
-                is_complete = completeness.complete_sets > 0 and completeness.incomplete_sets == 0
+                # We have valid data if at least one entity set is complete
+                has_complete_sets = completeness.complete_sets > 0
+                is_fully_complete = has_complete_sets and completeness.incomplete_sets == 0
+
                 results['completeness_check'] = {
-                    'success': is_complete,
+                    'success': is_fully_complete,
+                    'has_complete_sets': has_complete_sets,
                     'entities_complete': completeness.complete_entities,
                     'entities_incomplete': completeness.incomplete_entities,
                     'complete_sets': completeness.complete_sets,
@@ -397,9 +434,46 @@ class FullPipelineOrchestrator:
                     'total_files': completeness.total_files
                 }
 
-                # Completeness issues are warnings, not critical errors
-                if not is_complete:
+                # Move files from incomplete entity sets to invalid folder
+                if completeness.incomplete_entities:
+                    incomplete_entities = set(e.upper() for e in completeness.incomplete_entities)
+                    files_by_name = {f['filename']: f for f in files}
+
+                    for f in files:
+                        filename = f['filename']
+                        # Extract entity from filename (e.g., RHUM from hcm_person_intf_rhum_20260116.csv)
+                        name_result = validate_file_names([filename])
+                        if name_result.get('results'):
+                            file_entity = name_result['results'][0].entity
+                            if file_entity and file_entity.upper() in incomplete_entities:
+                                source_key = f.get('s3_key')
+                                if source_key:
+                                    dest_key = f"{folders['invalid']}/{filename}"
+                                    try:
+                                        self.s3_client.copy_object(
+                                            Bucket=self.bucket,
+                                            CopySource={'Bucket': self.bucket, 'Key': source_key},
+                                            Key=dest_key
+                                        )
+                                        self.s3_client.delete_object(Bucket=self.bucket, Key=source_key)
+                                        results['invalid_files'].append({
+                                            'filename': filename,
+                                            'reason': 'incomplete_entity_set',
+                                            'entity': file_entity
+                                        })
+                                    except Exception:
+                                        pass
+
+                    # Re-list files after moving incomplete sets
+                    files = self._list_initial_files(initial_folder)
+
+                # Only critical if NO complete entity sets remain
+                if not has_complete_sets:
+                    results['has_critical_errors'] = True
                     results['all_passed'] = False
+                elif not is_fully_complete:
+                    # Some incomplete sets were removed, but we have complete sets to process
+                    results['all_passed'] = False  # Not perfect, but we can continue
 
             except Exception as e:
                 results['completeness_check'] = {
@@ -410,6 +484,128 @@ class FullPipelineOrchestrator:
             # Final list of valid files
             files = self._list_initial_files(initial_folder)
             results['valid_files'] = [f['s3_key'] for f in files]
+
+            # Generate validation reports
+            pipeline_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+            # Generate name validation report
+            if results['name_validation'].get('invalid_count', 0) > 0:
+                name_report_lines = [
+                    "=" * 80,
+                    "FILE NAME VALIDATION REPORT",
+                    "=" * 80,
+                    "",
+                    "SUMMARY",
+                    "-" * 40,
+                    f"Total files checked: {results['name_validation'].get('files_checked', 0)}",
+                    f"Valid files: {results['name_validation'].get('valid_count', 0)}",
+                    f"Invalid files: {results['name_validation'].get('invalid_count', 0)}",
+                    "",
+                    "NOTE: Pipeline will continue processing VALID files.",
+                    "Invalid files have been moved to the InvalidFiles folder.",
+                    "",
+                    "EXPECTED FILE NAME FORMAT",
+                    "-" * 40,
+                    "Pattern: HCM_{SOURCE}_INTF_{ENTITY}_{DATE}.csv",
+                    "",
+                    "Valid SOURCES: PERSON, PERSON_NAME, PERSON_ASSIGNMENT, PERSON_ADDRESS, PERSON_NID, PERSON_SUPERVISOR, PERSON_EMAIL, SENIORITY",
+                    "Valid ENTITIES: 911, RHUM, HACIENDA, FIMAS, DOE, KRONOSPOL, KRONOSDE, SEPI, ADPPOLICIA",
+                    "Valid DATE formats: YYYYMMDD, YYYYMMDDHHMM, YYYYMMDDHHMMSS",
+                    "",
+                    "=" * 80,
+                    "INVALID FILES - ACTION REQUIRED",
+                    "=" * 80,
+                    ""
+                ]
+                for i, inv_file in enumerate(results['name_validation'].get('invalid_files', []), 1):
+                    name_report_lines.append(f"[{i}] FILE: {inv_file.get('file_name', 'Unknown')}")
+                    name_report_lines.append(f"    ERROR: {inv_file.get('error', 'Unknown error')}")
+                    name_report_lines.append("")
+
+                name_report_lines.append("=" * 80)
+                name_report_lines.append("END OF VALIDATION REPORT")
+                name_report_lines.append("=" * 80)
+
+                self._upload_report(
+                    folders['validation'],
+                    f'name_validation_{pipeline_id}.txt',
+                    "\n".join(name_report_lines)
+                )
+
+            # Generate completeness report
+            comp_check = results.get('completeness_check', {})
+            comp_report_lines = [
+                "=" * 80,
+                "FILE COMPLETENESS REPORT",
+                "=" * 80,
+                "",
+                "SUMMARY",
+                "-" * 40,
+                f"Total files: {comp_check.get('total_files', 0)}",
+                f"Complete entity sets: {comp_check.get('complete_sets', 0)}",
+                f"Incomplete entity sets: {comp_check.get('incomplete_sets', 0)}",
+                "",
+                "COMPLETE ENTITIES (will be processed):",
+            ]
+            for entity in comp_check.get('entities_complete', []):
+                comp_report_lines.append(f"  - {entity}")
+            if not comp_check.get('entities_complete'):
+                comp_report_lines.append("  (none)")
+
+            comp_report_lines.append("")
+            comp_report_lines.append("INCOMPLETE ENTITIES (moved to InvalidFiles):")
+            for entity in comp_check.get('entities_incomplete', []):
+                comp_report_lines.append(f"  - {entity}")
+            if not comp_check.get('entities_incomplete'):
+                comp_report_lines.append("  (none)")
+
+            comp_report_lines.append("")
+            comp_report_lines.append("=" * 80)
+
+            self._upload_report(
+                folders['validation'],
+                f'completeness_{pipeline_id}.txt',
+                "\n".join(comp_report_lines)
+            )
+
+            # Generate pipeline summary report
+            summary_lines = [
+                "=" * 80,
+                "PIPELINE VALIDATION SUMMARY",
+                "=" * 80,
+                "",
+                f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Folder: {folder}",
+                "",
+                "STEP RESULTS:",
+                "-" * 40,
+                f"1. Duplicate Check: {'PASS' if results['duplicate_check'].get('success') else 'FAIL'}",
+                f"   Duplicates found: {results['duplicate_check'].get('duplicates_found', 0)}",
+                "",
+                f"2. Name Validation: {'PASS' if results['name_validation'].get('success') else 'PARTIAL' if results['name_validation'].get('valid_count', 0) > 0 else 'FAIL'}",
+                f"   Valid files: {results['name_validation'].get('valid_count', 0)}",
+                f"   Invalid files: {results['name_validation'].get('invalid_count', 0)}",
+                "",
+                f"3. Schema Validation: {'PASS' if results['schema_validation'].get('success') else 'FAIL'}",
+                f"   Files checked: {results['schema_validation'].get('files_checked', 0)}",
+                f"   Invalid count: {results['schema_validation'].get('invalid_count', 0)}",
+                "",
+                f"4. Completeness Check: {'PASS' if comp_check.get('success') else 'PARTIAL' if comp_check.get('has_complete_sets') else 'FAIL'}",
+                f"   Complete sets: {comp_check.get('complete_sets', 0)}",
+                f"   Incomplete sets: {comp_check.get('incomplete_sets', 0)}",
+                "",
+                "-" * 40,
+                f"OVERALL: {'PASSED' if results['all_passed'] else 'PASSED WITH WARNINGS' if not results['has_critical_errors'] else 'FAILED'}",
+                f"Files to process: {len(results['valid_files'])}",
+                "",
+                "=" * 80,
+            ]
+
+            self._upload_report(
+                folders['validation'],
+                f'pipeline_summary_{pipeline_id}.txt',
+                "\n".join(summary_lines)
+            )
 
             return results
 
@@ -2504,23 +2700,102 @@ def pipeline_step_handler(event, context):
             # Generate report (validation error, procedure error, or success)
             report_type = event.get('report_type', 'unknown')
             folder = event.get('folder')
+            s3_bucket = event.get('s3_bucket', os.environ.get('S3_BUCKET', 'hacienda-sftp-downloads'))
 
             result['report_type'] = report_type
             result['folder'] = folder
             result['success'] = True
             result['message'] = f"Report type: {report_type}"
 
+            # Generate and write the report to S3
+            s3_client = boto3.client('s3')
+            report_lines = []
+            report_lines.append(f"{'='*60}")
+            report_lines.append(f"Pipeline Report - {report_type.upper().replace('_', ' ')}")
+            report_lines.append(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+            report_lines.append(f"Folder: {folder}")
+            report_lines.append(f"{'='*60}")
+            report_lines.append("")
+
             # Include relevant data based on report type
             if report_type == 'validation_error':
-                result['validation_result'] = event.get('validation_result', {})
+                validation_result = event.get('validation_result', {})
+                result['validation_result'] = validation_result
+
+                report_lines.append("VALIDATION FAILED")
+                report_lines.append("-" * 40)
+
+                # Duplicate check
+                dup = validation_result.get('duplicate_check', {})
+                report_lines.append(f"\n1. Duplicate Check: {'PASS' if dup.get('success') else 'FAIL'}")
+                report_lines.append(f"   Duplicates found: {dup.get('duplicates_found', 0)}")
+                report_lines.append(f"   Files remaining: {dup.get('files_remaining', 0)}")
+
+                # Name validation
+                name = validation_result.get('name_validation', {})
+                report_lines.append(f"\n2. Name Validation: {'PASS' if name.get('success') else 'FAIL'}")
+                report_lines.append(f"   Files checked: {name.get('files_checked', 0)}")
+                report_lines.append(f"   Invalid count: {name.get('invalid_count', 0)}")
+                if name.get('invalid_files'):
+                    report_lines.append("   Invalid files:")
+                    for f in name.get('invalid_files', []):
+                        report_lines.append(f"     - {f.get('file_name')}: {f.get('error')}")
+
+                # Schema validation
+                schema = validation_result.get('schema_validation', {})
+                report_lines.append(f"\n3. Schema Validation: {'PASS' if schema.get('success') else 'FAIL'}")
+                report_lines.append(f"   Files checked: {schema.get('files_checked', 0)}")
+                report_lines.append(f"   Invalid count: {schema.get('invalid_count', 0)}")
+                if schema.get('invalid_files'):
+                    report_lines.append("   Invalid files:")
+                    for f in schema.get('invalid_files', []):
+                        report_lines.append(f"     - {f.get('file_name')}: {f.get('error')}")
+
+                # Completeness check
+                comp = validation_result.get('completeness_check', {})
+                report_lines.append(f"\n4. Completeness Check: {'PASS' if comp.get('success') else 'FAIL'}")
+                report_lines.append(f"   Complete sets: {comp.get('complete_sets', 0)}")
+                report_lines.append(f"   Incomplete sets: {comp.get('incomplete_sets', 0)}")
+                report_lines.append(f"   Complete entities: {', '.join(comp.get('entities_complete', []))}")
+                report_lines.append(f"   Incomplete entities: {', '.join(comp.get('entities_incomplete', []))}")
+
             elif report_type == 'procedure_error':
-                result['proc_status'] = event.get('proc_status', {})
+                proc_status = event.get('proc_status', {})
+                result['proc_status'] = proc_status
+
+                report_lines.append("STORED PROCEDURE FAILED")
+                report_lines.append("-" * 40)
+                report_lines.append(f"Status: {proc_status.get('status', 'Unknown')}")
+                report_lines.append(f"Error: {proc_status.get('error', 'Unknown error')}")
+                if proc_status.get('completed_steps'):
+                    report_lines.append(f"Completed steps: {', '.join(proc_status.get('completed_steps', []))}")
+
             elif report_type == 'pipeline_success':
                 result['sftp_download'] = event.get('sftp_download', {})
                 result['validation'] = event.get('validation', {})
                 result['sql_load'] = event.get('sql_load', {})
                 result['proc_status'] = event.get('proc_status', {})
                 result['export'] = event.get('export', {})
+
+                report_lines.append("PIPELINE COMPLETED SUCCESSFULLY")
+                report_lines.append("-" * 40)
+
+            # Write report to S3 - use the standard folder structure
+            report_content = "\n".join(report_lines)
+            report_key = f"{folder}/2_Validation_Reports/Validation Report.txt"
+
+            try:
+                s3_client.put_object(
+                    Bucket=s3_bucket,
+                    Key=report_key,
+                    Body=report_content.encode('utf-8'),
+                    ContentType='text/plain'
+                )
+                result['report_key'] = report_key
+                result['report_written'] = True
+            except Exception as e:
+                result['report_write_error'] = str(e)
+                result['report_written'] = False
 
         elif action in ['validation_error', 'procedure_error', 'pipeline_success']:
             # Legacy report action handling

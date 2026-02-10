@@ -16,7 +16,7 @@ const PIPELINE_STEPS = [
   {
     id: 'validation',
     label: 'Validations',
-    reportFile: null,
+    reportFile: 'Validation Report.txt',
     subTasks: [
       { id: 'duplicates', label: 'Duplicate/Obsolete Validation', reportFile: 'Duplicate-Obsolete Validation.txt', expandable: true },
       { id: 'completeness', label: 'Completeness Validation', reportFile: 'Completeness Validation.txt', showProgress: true },
@@ -982,19 +982,23 @@ function PipelineInterface() {
         return;
       }
 
-      // Map filenames to their S3 paths
+      // Map filenames to their S3 paths using correct folder structure
+      // 2_Validation_Reports/ - validation reports (name, completeness, schema, summary)
+      // 3_Load_Reports/ - SQL load reports
+      // 6_Delta_Files/ - export files
       const reportPaths = {
-        'Downloaded Files.txt': `${folder}/reports/Downloaded Files.txt`,
-        'Duplicate-Obsolete Validation.txt': `${folder}/reports/Duplicate-Obsolete Validation.txt`,
-        'Completeness Validation.txt': `${folder}/reports/Completeness Validation.txt`,
-        'File Name Validation.txt': `${folder}/reports/File Name Validation.txt`,
-        'Load Database Report.txt': `${folder}/reports/Load Database Report.txt`,
-        'Process Data Report.txt': `${folder}/reports/Process Data Report.txt`,
-        'Generate Files Report.txt': `${folder}/reports/Generate Files Report.txt`,
-        'Pipeline Report.txt': `${folder}/reports/Pipeline Report.txt`
+        'Downloaded Files.txt': `${folder}/2_Validation_Reports/Downloaded Files.txt`,
+        'Duplicate-Obsolete Validation.txt': `${folder}/2_Validation_Reports/Duplicate-Obsolete Validation.txt`,
+        'Completeness Validation.txt': `${folder}/2_Validation_Reports/Completeness Validation.txt`,
+        'File Name Validation.txt': `${folder}/2_Validation_Reports/File Name Validation.txt`,
+        'Validation Report.txt': `${folder}/2_Validation_Reports/Validation Report.txt`,
+        'Load Database Report.txt': `${folder}/3_Load_Reports/Load Database Report.txt`,
+        'Process Data Report.txt': `${folder}/3_Load_Reports/Process Data Report.txt`,
+        'Generate Files Report.txt': `${folder}/6_Delta_Files/Generate Files Report.txt`,
+        'Pipeline Report.txt': `${folder}/2_Validation_Reports/Pipeline Report.txt`
       };
 
-      const s3Key = reportKey || reportPaths[filename] || `${folder}/reports/${filename}`;
+      const s3Key = reportKey || reportPaths[filename] || `${folder}/2_Validation_Reports/${filename}`;
 
       // Get pre-signed URL for download
       const response = await getReportDownloadUrl(s3Key);
