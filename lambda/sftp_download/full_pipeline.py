@@ -327,22 +327,27 @@ class FullPipelineOrchestrator:
 
             # Step 3: Schema Validation
             try:
-                schema_result = validate_files_schema(
-                    self.bucket,
-                    [f['s3_key'] for f in files]
+                # validate_files_schema expects (files_list, s3_client, bucket) and returns SchemaValidationReport
+                schema_report = validate_files_schema(
+                    files,  # List of dicts with 'filename' and 's3_key'
+                    self.s3_client,
+                    self.bucket
                 )
 
-                invalid_schema = [r for r in schema_result if not r.get('valid', False)]
+                # SchemaValidationReport has .results (list of ColumnValidationResult dataclasses)
+                invalid_schema = [r for r in schema_report.results if not r.is_valid]
                 results['schema_validation'] = {
                     'success': len(invalid_schema) == 0,
-                    'files_checked': len(files),
+                    'files_checked': schema_report.total_files,
                     'invalid_count': len(invalid_schema),
-                    'invalid_files': invalid_schema[:10]
+                    'invalid_files': [{'file_name': r.file_name, 'error': r.error_message} for r in invalid_schema[:10]]
                 }
 
-                # Move invalid schema files
+                # Move invalid schema files - find their s3_keys from the original files list
+                files_by_name = {f['filename']: f for f in files}
                 for invalid in invalid_schema:
-                    source_key = invalid.get('s3_key')
+                    file_info = files_by_name.get(invalid.file_name)
+                    source_key = file_info.get('s3_key') if file_info else None
                     if source_key:
                         filename = source_key.split('/')[-1]
                         dest_key = f"{folders['invalid_schema']}{filename}"
