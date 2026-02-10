@@ -91,11 +91,22 @@ BEGIN
             EXEC dbo.HCM_MAIN_INTF @test_execution = @TestExecution
         END
 
-        -- Mark as completed
+        -- Mark as completed in queue
         UPDATE dbo.PROCEDURE_RUN_QUEUE
         SET Status = 'COMPLETED',
             CompletedAt = GETDATE()
         WHERE RequestID = @RequestID
+
+        -- Also update RUN_INTF_STATUS to 02-Completed so delta export can proceed
+        BEGIN TRY
+            UPDATE dbo.RUN_INTF_STATUS
+            SET Status = '02-Completed', DateCompleted = SYSDATETIME()
+            WHERE Instance = (SELECT MAX(Instance) FROM dbo.RUN_INTF_STATUS)
+            AND Status = '01-InProgress'
+        END TRY
+        BEGIN CATCH
+            -- Ignore errors - procedure may have already updated this
+        END CATCH
 
     END TRY
     BEGIN CATCH
