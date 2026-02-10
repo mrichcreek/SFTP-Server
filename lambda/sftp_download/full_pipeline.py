@@ -358,7 +358,7 @@ class FullPipelineOrchestrator:
                         source_key = file_info.get('s3_key') if file_info else None
                         if source_key:
                             filename = source_key.split('/')[-1]
-                            dest_key = f"{folders['invalid']}/{filename}"
+                            dest_key = f"{folders['invalid']}{filename}"
                             try:
                                 self.s3_client.copy_object(
                                     Bucket=self.bucket,
@@ -371,8 +371,12 @@ class FullPipelineOrchestrator:
                                     'reason': 'name_invalid',
                                     'error': invalid_result.error_message
                                 })
-                            except Exception:
-                                pass
+                            except Exception as e:
+                                results['invalid_files'].append({
+                                    'filename': filename,
+                                    'reason': 'move_failed',
+                                    'error': str(e)
+                                })
 
                     # Re-list files after moving invalid ones
                     files = self._list_initial_files(initial_folder)
@@ -478,7 +482,7 @@ class FullPipelineOrchestrator:
                             if file_entity and file_entity.upper() in incomplete_entities:
                                 source_key = f.get('s3_key')
                                 if source_key:
-                                    dest_key = f"{folders['invalid']}/{filename}"
+                                    dest_key = f"{folders['invalid']}{filename}"
                                     try:
                                         self.s3_client.copy_object(
                                             Bucket=self.bucket,
@@ -491,8 +495,12 @@ class FullPipelineOrchestrator:
                                             'reason': 'incomplete_entity_set',
                                             'entity': file_entity
                                         })
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        results['invalid_files'].append({
+                                            'filename': filename,
+                                            'reason': 'move_failed',
+                                            'error': str(e)
+                                        })
 
                     # Re-list files after moving incomplete sets
                     files = self._list_initial_files(initial_folder)
