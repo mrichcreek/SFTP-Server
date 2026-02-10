@@ -1016,6 +1016,82 @@ function PipelineInterface() {
     }
   };
 
+  // Handle downloading full combined report
+  const handleDownloadFullReport = async (folderName) => {
+    if (!folderName) {
+      alert('Pipeline folder not available.');
+      return;
+    }
+
+    // List of all reports to combine
+    const allReports = [
+      { name: 'Downloaded Files.txt', path: `${folderName}/2_Validation_Reports/Downloaded Files.txt` },
+      { name: 'Duplicate-Obsolete Validation.txt', path: `${folderName}/2_Validation_Reports/Duplicate-Obsolete Validation.txt` },
+      { name: 'File Name Validation.txt', path: `${folderName}/2_Validation_Reports/File Name Validation.txt` },
+      { name: 'Completeness Validation.txt', path: `${folderName}/2_Validation_Reports/Completeness Validation.txt` },
+      { name: 'Pipeline Summary.txt', path: `${folderName}/2_Validation_Reports/Pipeline Summary.txt` },
+      { name: 'Load Database Report.txt', path: `${folderName}/3_Load_Reports/Load Database Report.txt` },
+      { name: 'Process Data Report.txt', path: `${folderName}/3_Load_Reports/Process Data Report.txt` },
+      { name: 'Generate Files Report.txt', path: `${folderName}/6_Delta_Files/Generate Files Report.txt` }
+    ];
+
+    let combinedReport = '';
+    combinedReport += '='.repeat(80) + '\n';
+    combinedReport += 'HACIENDA ERP PIPELINE - FULL REPORT\n';
+    combinedReport += '='.repeat(80) + '\n';
+    combinedReport += `Folder: ${folderName}\n`;
+    combinedReport += `Generated: ${new Date().toLocaleString()}\n`;
+    combinedReport += '='.repeat(80) + '\n\n';
+
+    let successCount = 0;
+    let failCount = 0;
+
+    for (const report of allReports) {
+      try {
+        const response = await getReportDownloadUrl(report.path);
+        if (response.url) {
+          // Fetch the report content
+          const reportResponse = await fetch(response.url);
+          if (reportResponse.ok) {
+            const content = await reportResponse.text();
+            combinedReport += '\n\n';
+            combinedReport += '#'.repeat(80) + '\n';
+            combinedReport += `# ${report.name}\n`;
+            combinedReport += '#'.repeat(80) + '\n\n';
+            combinedReport += content;
+            successCount++;
+          } else {
+            combinedReport += `\n\n[${report.name}]: Report not available\n`;
+            failCount++;
+          }
+        } else {
+          combinedReport += `\n\n[${report.name}]: Report not found\n`;
+          failCount++;
+        }
+      } catch (err) {
+        combinedReport += `\n\n[${report.name}]: Error fetching report - ${err.message}\n`;
+        failCount++;
+      }
+    }
+
+    combinedReport += '\n\n';
+    combinedReport += '='.repeat(80) + '\n';
+    combinedReport += 'END OF FULL REPORT\n';
+    combinedReport += `Reports included: ${successCount} | Reports missing: ${failCount}\n`;
+    combinedReport += '='.repeat(80) + '\n';
+
+    // Create and download the combined report
+    const blob = new Blob([combinedReport], { type: 'text/plain' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${folderName}_Full_Report.txt`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   const handleStartPipeline = async () => {
     setIsRunning(true);
     setError(null);
@@ -1224,6 +1300,41 @@ function PipelineInterface() {
                   folderName={getFolderName()}
                 />
               ))}
+
+              {/* Download Full Report Button */}
+              {getFolderName() && (processInfo.status === 'SUCCEEDED' || processInfo.status === 'FAILED' || !isRunning) && (
+                <div style={{
+                  marginTop: '24px',
+                  padding: '20px',
+                  backgroundColor: COLORS.bgLight,
+                  borderRadius: '12px',
+                  border: `1px solid ${COLORS.border}`,
+                  textAlign: 'center'
+                }}>
+                  <button
+                    onClick={() => handleDownloadFullReport(getFolderName())}
+                    style={{
+                      padding: '14px 32px',
+                      backgroundColor: COLORS.primary,
+                      color: 'white',
+                      border: 'none',
+                      borderRadius: '8px',
+                      fontSize: '15px',
+                      fontWeight: '600',
+                      cursor: 'pointer',
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: '8px'
+                    }}
+                  >
+                    <span>📋</span>
+                    Download Full Report
+                  </button>
+                  <div style={{ marginTop: '8px', fontSize: '13px', color: COLORS.textSecondary }}>
+                    Combines all reports into a single document
+                  </div>
+                </div>
+              )}
             </div>
           ) : (
             <div style={{ textAlign: 'center', padding: '60px 20px', color: COLORS.textSecondary }}>

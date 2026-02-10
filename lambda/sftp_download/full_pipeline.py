@@ -290,6 +290,36 @@ class FullPipelineOrchestrator:
                     'files_remaining': dup_result.get('files_remaining', len(files))
                 }
 
+                # Generate Duplicate-Obsolete Validation report
+                dup_report_lines = [
+                    "=" * 80,
+                    "DUPLICATE/OBSOLETE FILE VALIDATION REPORT",
+                    "=" * 80,
+                    "",
+                    "SUMMARY",
+                    "-" * 40,
+                    f"Files scanned: {len(files)}",
+                    f"Duplicates found: {dup_result.get('duplicates_moved', 0)}",
+                    f"Obsolete files found: {dup_result.get('obsolete_moved', 0)}",
+                    f"Files remaining: {dup_result.get('files_remaining', len(files))}",
+                    "",
+                ]
+                if dup_result.get('duplicates_moved', 0) > 0 or dup_result.get('obsolete_moved', 0) > 0:
+                    dup_report_lines.append("REMOVED FILES:")
+                    dup_report_lines.append("-" * 40)
+                    for moved_file in dup_result.get('moved_files', []):
+                        dup_report_lines.append(f"  - {moved_file}")
+                else:
+                    dup_report_lines.append("No duplicate or obsolete files found.")
+                dup_report_lines.append("")
+                dup_report_lines.append("=" * 80)
+
+                self._upload_report(
+                    folders['validation'],
+                    'Duplicate-Obsolete Validation.txt',
+                    "\n".join(dup_report_lines)
+                )
+
                 # Re-list files after duplicate removal
                 files = self._list_initial_files(initial_folder)
 
@@ -2547,6 +2577,9 @@ def pipeline_step_handler(event, context):
             )
             result.update(download_result)
 
+            # Store file details for later report generation
+            result['downloaded_files'] = download_result.get('file_results', [])
+
         elif action == 'create_folders':
             # Create timestamped folder and organize files
             source_prefix = event.get('source_prefix', 'downloads/')
@@ -2557,6 +2590,46 @@ def pipeline_step_handler(event, context):
             result['folder_name'] = folder_result.get('folder_name')
             result['files_moved'] = folder_result.get('files_moved', 0)
             result['success'] = folder_result.get('success', False)
+
+            # Generate Downloaded Files report
+            folder_name = folder_result.get('folder_name')
+            if folder_name and folder_result.get('success'):
+                files_info = folder_result.get('files', [])
+                sftp_result = event.get('sftp_download', {})
+                file_results = sftp_result.get('file_results', [])
+
+                download_report_lines = [
+                    "=" * 80,
+                    "DOWNLOADED FILES REPORT",
+                    "=" * 80,
+                    "",
+                    "SUMMARY",
+                    "-" * 40,
+                    f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    f"Folder: {folder_name}",
+                    f"Total files downloaded: {len(files_info)}",
+                    f"Total size: {sum(f.get('size', 0) for f in files_info):,} bytes",
+                    "",
+                    "FILES DOWNLOADED:",
+                    "-" * 40,
+                ]
+
+                for i, file_info in enumerate(files_info, 1):
+                    filename = file_info.get('filename', file_info.get('dest_key', '').split('/')[-1])
+                    size = file_info.get('size', 0)
+                    download_report_lines.append(f"  {i}. {filename} ({size:,} bytes)")
+
+                download_report_lines.append("")
+                download_report_lines.append("=" * 80)
+
+                s3_client = boto3.client('s3')
+                report_key = f"{folder_name}/2_Validation_Reports/Downloaded Files.txt"
+                s3_client.put_object(
+                    Bucket=bucket,
+                    Key=report_key,
+                    Body="\n".join(download_report_lines).encode('utf-8'),
+                    ContentType='text/plain'
+                )
 
         elif action == 'full_validation':
             # Run all validation steps
@@ -2654,6 +2727,49 @@ def pipeline_step_handler(event, context):
                 result['delta_counts'] = status_result.get('delta_counts', {})
                 result['success'] = True
 
+                # Generate Process Data Report when procedure completes
+                folder = event.get('folder')
+                if folder and status_result.get('is_completed'):
+                    proc_report_lines = [
+                        "=" * 80,
+                        "PROCESS DATA REPORT",
+                        "=" * 80,
+                        "",
+                        "SUMMARY",
+                        "-" * 40,
+                        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"Status: {'COMPLETED' if status_result.get('is_completed') else 'IN PROGRESS'}",
+                        f"Current Step: {status_result.get('current_step', 'N/A')}",
+                        "",
+                        "STEPS COMPLETED:",
+                        "-" * 40,
+                    ]
+                    for step in status_result.get('steps_completed', []):
+                        proc_report_lines.append(f"  - {step}")
+                    if not status_result.get('steps_completed'):
+                        proc_report_lines.append("  (none)")
+
+                    proc_report_lines.append("")
+                    proc_report_lines.append("DELTA RECORD COUNTS:")
+                    proc_report_lines.append("-" * 40)
+                    delta_counts = status_result.get('delta_counts', {})
+                    total_deltas = 0
+                    for table, count in delta_counts.items():
+                        proc_report_lines.append(f"  {table}: {count:,}")
+                        total_deltas += count
+                    proc_report_lines.append(f"  TOTAL: {total_deltas:,}")
+                    proc_report_lines.append("")
+                    proc_report_lines.append("=" * 80)
+
+                    s3_client = boto3.client('s3')
+                    report_key = f"{folder}/3_Load_Reports/Process Data Report.txt"
+                    s3_client.put_object(
+                        Bucket=bucket,
+                        Key=report_key,
+                        Body="\n".join(proc_report_lines).encode('utf-8'),
+                        ContentType='text/plain'
+                    )
+
             except Exception as e:
                 result['error'] = str(e)
                 result['success'] = False
@@ -2689,6 +2805,46 @@ def pipeline_step_handler(event, context):
                 result.update(export_result)
                 result['folder'] = folder
                 result['success'] = export_result.get('success', False)
+
+                # Generate Files Report
+                if folder:
+                    files_exported = export_result.get('files_exported', [])
+                    export_report_lines = [
+                        "=" * 80,
+                        "GENERATE FILES REPORT",
+                        "=" * 80,
+                        "",
+                        "SUMMARY",
+                        "-" * 40,
+                        f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                        f"Folder: {folder}",
+                        f"Total files exported: {len(files_exported)}",
+                        f"Total rows: {export_result.get('total_rows', 0):,}",
+                        f"Success: {'YES' if export_result.get('success') else 'NO'}",
+                        "",
+                        "FILES EXPORTED:",
+                        "-" * 40,
+                    ]
+
+                    for i, file_info in enumerate(files_exported, 1):
+                        filename = file_info.get('filename', file_info.get('s3_key', '').split('/')[-1])
+                        row_count = file_info.get('row_count', 0)
+                        export_report_lines.append(f"  {i}. {filename} ({row_count:,} rows)")
+
+                    if not files_exported:
+                        export_report_lines.append("  (no files exported)")
+
+                    export_report_lines.append("")
+                    export_report_lines.append("=" * 80)
+
+                    s3_client = boto3.client('s3')
+                    report_key = f"{folder}/6_Delta_Files/Generate Files Report.txt"
+                    s3_client.put_object(
+                        Bucket=bucket,
+                        Key=report_key,
+                        Body="\n".join(export_report_lines).encode('utf-8'),
+                        ContentType='text/plain'
+                    )
 
             except Exception as e:
                 import traceback
