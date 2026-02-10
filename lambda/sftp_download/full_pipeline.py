@@ -304,12 +304,15 @@ class FullPipelineOrchestrator:
                 file_list = [f['filename'] for f in files]
                 name_result = validate_file_names(file_list)
 
-                invalid_names = [r for r in name_result if not r.get('valid', False)]
+                # name_result is a dict with 'results' list of ValidationResult dataclass objects
+                validation_results = name_result.get('results', [])
+                # ValidationResult has is_valid attribute, not 'valid' key
+                invalid_names = [r for r in validation_results if not r.is_valid]
                 results['name_validation'] = {
                     'success': len(invalid_names) == 0,
                     'files_checked': len(file_list),
                     'invalid_count': len(invalid_names),
-                    'invalid_files': invalid_names[:10]  # Limit for response size
+                    'invalid_files': [{'file_name': r.file_name, 'error': r.error_message} for r in invalid_names[:10]]
                 }
 
                 if invalid_names:
@@ -378,15 +381,19 @@ class FullPipelineOrchestrator:
 
                 completeness = check_file_completeness(file_list)
 
+                # CompletenessResult is a dataclass, access attributes directly
+                is_complete = completeness.complete_sets > 0 and completeness.incomplete_sets == 0
                 results['completeness_check'] = {
-                    'success': completeness.get('complete', False),
-                    'entities_complete': completeness.get('entities_complete', []),
-                    'entities_incomplete': completeness.get('entities_incomplete', []),
-                    'missing_files': completeness.get('missing_files', [])[:20]  # Limit
+                    'success': is_complete,
+                    'entities_complete': completeness.complete_entities,
+                    'entities_incomplete': completeness.incomplete_entities,
+                    'complete_sets': completeness.complete_sets,
+                    'incomplete_sets': completeness.incomplete_sets,
+                    'total_files': completeness.total_files
                 }
 
                 # Completeness issues are warnings, not critical errors
-                if not completeness.get('complete', False):
+                if not is_complete:
                     results['all_passed'] = False
 
             except Exception as e:

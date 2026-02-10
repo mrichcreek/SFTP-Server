@@ -47,8 +47,8 @@ const PIPELINE_STEPS = [
     label: 'Generate Export Files',
     reportFile: 'Generate Files Report.txt',
     subTasks: [
-      { id: 'rhum', label: 'RHUM Files', expandable: true, expandLabel: 'files' },
-      { id: 'hacienda', label: 'HACIENDA Files', expandable: true, expandLabel: 'files' }
+      { id: 'rhum', label: 'INT012 Files (Hire/Rehire)', expandable: true, expandLabel: 'files' },
+      { id: 'hacienda', label: 'Delta Files', expandable: true, expandLabel: 'files' }
     ]
   },
   {
@@ -818,36 +818,41 @@ function PipelineInterface() {
       // Extract Delta Export results
       const exportResult = detailsData.exportResult;
       if (exportResult || isExportDone) {
-        // Handle both 'exported_files' (array of paths) and 'files_exported' (array of objects)
-        const exportedFiles = exportResult?.exported_files ||
-                              (exportResult?.files_exported || []).map(f => f.s3_key || f.filename || f);
-        const rhumExports = exportedFiles.filter(f => (typeof f === 'string' ? f : '').toLowerCase().includes('rhum'));
-        const haciendaExports = exportedFiles.filter(f => !(typeof f === 'string' ? f : '').toLowerCase().includes('rhum'));
+        // Handle 'files_exported' (array of objects with s3_key, filename, row_count)
+        const filesExportedArray = exportResult?.files_exported || [];
+        const exportedFilenames = filesExportedArray.map(f => f.filename || f.s3_key?.split('/').pop() || f);
 
         // Determine success: explicit success property, or infer from files exported
-        const filesExported = exportResult?.total_files || exportedFiles.length || 0;
+        const filesExported = exportResult?.total_files || filesExportedArray.length || 0;
+        const totalRows = exportResult?.total_rows || filesExportedArray.reduce((sum, f) => sum + (f.row_count || 0), 0);
         const hasExplicitSuccess = exportResult?.success !== undefined;
         const isSuccess = hasExplicitSuccess ? exportResult.success : (filesExported > 0 || isExportDone);
+
+        // Split files by INT012 (hire/rehire) vs normal - these are labeled RHUM/HACIENDA in UI but actually represent INT012/Normal split
+        const int012Files = filesExportedArray.filter(f => (f.category === 'INT012' || (f.filename || '').includes('INT012')));
+        const normalFiles = filesExportedArray.filter(f => (f.category === 'NORMAL' || (!(f.filename || '').includes('INT012') && f.category !== 'INT012')));
 
         newStepData.delta_export = {
           status: isExportDone ? (isSuccess ? 'pass' : 'fail') : 'in progress',
           duration: 0,
           outputPrefix: exportResult?.output_prefix,
           totalFiles: filesExported,
-          totalRows: exportResult?.total_rows || 0,
+          totalRows: totalRows,
           subTasks: {
             rhum: {
-              status: rhumExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
-              count: rhumExports.length,
-              message: rhumExports.length > 0 ? `${rhumExports.length} files` : undefined,
-              files: rhumExports.map(f => ({ name: (typeof f === 'string' ? f.split('/').pop() : f), status: 'completed' })),
+              // This is actually INT012 files (new hires/rehires)
+              status: int012Files.length > 0 ? 'pass' : (filesExported > 0 ? 'skipped' : (isExportDone ? 'skipped' : 'pending')),
+              count: int012Files.length,
+              message: int012Files.length > 0 ? `${int012Files.length} INT012 files` : (filesExported > 0 ? 'No INT012 records' : undefined),
+              files: int012Files.map(f => ({ name: f.filename || f.s3_key?.split('/').pop(), status: 'completed' })),
               isExpanded: getExpandedState('delta_export', 'rhum')
             },
             hacienda: {
-              status: haciendaExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
-              count: haciendaExports.length,
-              message: haciendaExports.length > 0 ? `${haciendaExports.length} files` : undefined,
-              files: haciendaExports.map(f => ({ name: (typeof f === 'string' ? f.split('/').pop() : f), status: 'completed' })),
+              // This is actually normal delta files
+              status: normalFiles.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
+              count: normalFiles.length,
+              message: normalFiles.length > 0 ? `${normalFiles.length} delta files` : undefined,
+              files: normalFiles.map(f => ({ name: f.filename || f.s3_key?.split('/').pop(), status: 'completed' })),
               isExpanded: getExpandedState('delta_export', 'hacienda')
             }
           }
