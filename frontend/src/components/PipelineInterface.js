@@ -54,7 +54,7 @@ const PIPELINE_STEPS = [
   {
     id: 'generate_report',
     label: 'Generate Final Report',
-    reportFile: 'Pipeline Report.txt',
+    reportFile: 'Pipeline Summary.txt',
     subTasks: [
       { id: 'collect', label: 'Collect Statistics' },
       { id: 'generate', label: 'Generate Summary' }
@@ -992,10 +992,11 @@ function PipelineInterface() {
         'Completeness Validation.txt': `${folder}/2_Validation_Reports/Completeness Validation.txt`,
         'File Name Validation.txt': `${folder}/2_Validation_Reports/File Name Validation.txt`,
         'Validation Report.txt': `${folder}/2_Validation_Reports/Validation Report.txt`,
+        'Pipeline Summary.txt': `${folder}/2_Validation_Reports/Pipeline Summary.txt`,
         'Load Database Report.txt': `${folder}/3_Load_Reports/Load Database Report.txt`,
         'Process Data Report.txt': `${folder}/3_Load_Reports/Process Data Report.txt`,
         'Generate Files Report.txt': `${folder}/6_Delta_Files/Generate Files Report.txt`,
-        'Pipeline Report.txt': `${folder}/2_Validation_Reports/Pipeline Report.txt`
+        'Pipeline Report.txt': `${folder}/2_Validation_Reports/Pipeline Summary.txt`
       };
 
       const s3Key = reportKey || reportPaths[filename] || `${folder}/2_Validation_Reports/${filename}`;

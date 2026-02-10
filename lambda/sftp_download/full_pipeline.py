@@ -528,7 +528,7 @@ class FullPipelineOrchestrator:
 
                 self._upload_report(
                     folders['validation'],
-                    f'name_validation_{pipeline_id}.txt',
+                    'File Name Validation.txt',
                     "\n".join(name_report_lines)
                 )
 
@@ -564,7 +564,7 @@ class FullPipelineOrchestrator:
 
             self._upload_report(
                 folders['validation'],
-                f'completeness_{pipeline_id}.txt',
+                'Completeness Validation.txt',
                 "\n".join(comp_report_lines)
             )
 
@@ -603,7 +603,7 @@ class FullPipelineOrchestrator:
 
             self._upload_report(
                 folders['validation'],
-                f'pipeline_summary_{pipeline_id}.txt',
+                'Pipeline Summary.txt',
                 "\n".join(summary_lines)
             )
 
@@ -697,7 +697,7 @@ class FullPipelineOrchestrator:
 
             report_key = self._upload_report(
                 folders['load'],
-                f"sql_load_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                "Load Database Report.txt",
                 report_content
             )
 
@@ -1179,7 +1179,7 @@ class FullPipelineOrchestrator:
 
                 report_key = self._upload_report(
                     folders['validation'],
-                    f'name_validation_{pipeline_id}.txt',
+                    'File Name Validation.txt',
                     report_content
                 )
 
@@ -1378,7 +1378,7 @@ class FullPipelineOrchestrator:
                 report_content = generate_completeness_report(completeness_result)
                 report_key = self._upload_report(
                     folders['validation'],
-                    f'completeness_{pipeline_id}.txt',
+                    'Completeness Validation.txt',
                     report_content
                 )
                 incomplete_entity_report = report_key
@@ -1473,7 +1473,7 @@ class FullPipelineOrchestrator:
                 load_report_content = self._generate_load_report(load_results)
                 report_key = self._upload_report(
                     folders['load'],
-                    f'sql_load_{pipeline_id}.txt',
+                    'Load Database Report.txt',
                     load_report_content
                 )
 
@@ -1603,8 +1603,8 @@ class FullPipelineOrchestrator:
                     # Generate export report
                     export_report_content = self._generate_export_report(export_result)
                     report_key = self._upload_report(
-                        folders['export'],
-                        f'export_{pipeline_id}.txt',
+                        folders['delta'],
+                        'Generate Files Report.txt',
                         export_report_content
                     )
 
@@ -1783,7 +1783,7 @@ class FullPipelineOrchestrator:
             summary_report = self._generate_summary_report(result)
             summary_key = self._upload_report(
                 folders['validation'],
-                f'pipeline_summary_{pipeline_id}.txt',
+                'Pipeline Summary.txt',
                 summary_report
             )
             result.report_url = self._generate_presigned_url(summary_key)
