@@ -709,7 +709,9 @@ class FullPipelineOrchestrator:
                         'filename': filename,
                         'success': result.get('success', False),
                         'table_name': result.get('table_name'),
-                        'rows_loaded': result.get('rows_loaded', 0)
+                        'rows_loaded': result.get('rows_loaded', 0),
+                        'error': result.get('error'),
+                        'error_type': result.get('error_type')
                     })
 
                     if result.get('success'):
@@ -717,10 +719,12 @@ class FullPipelineOrchestrator:
                         total_rows += result.get('rows_loaded', 0)
 
                 except Exception as e:
+                    import traceback
                     load_results.append({
                         'filename': filename,
                         'success': False,
-                        'error': str(e)
+                        'error': str(e),
+                        'traceback': traceback.format_exc()
                     })
 
             # Generate load report

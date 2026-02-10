@@ -998,6 +998,7 @@ def extract_entity_from_filename(filename: str) -> Optional[str]:
 def extract_table_name_from_filename(filename: str) -> Tuple[Optional[str], Optional[str]]:
     """
     Extract the table name and date portion from a filename.
+    Normalizes source aliases (e.g., HAC88 -> HACIENDA, RHUM75 -> RHUM).
 
     Returns:
         Tuple of (table_name, date_portion) or (None, None) if parsing fails
@@ -1011,6 +1012,14 @@ def extract_table_name_from_filename(filename: str) -> Tuple[Optional[str], Opti
     if match:
         table_name = match.group(1).upper()
         date_portion = match.group(2)
+
+        # Normalize source aliases in the table name
+        # e.g., HCM_PERSON_ADDRESS_INTF_HAC88 -> HCM_PERSON_ADDRESS_INTF_HACIENDA
+        for alias, normalized in SOURCE_ALIASES.items():
+            if table_name.endswith('_' + alias):
+                table_name = table_name[:-len(alias)] + normalized
+                break
+
         return table_name, date_portion
 
     return None, None
