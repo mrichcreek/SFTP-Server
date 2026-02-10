@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { startPipeline, getPipelineStatus, listPipelineExecutions } from '../services/api';
+import { startPipeline, getPipelineStatus, listPipelineExecutions, getReportDownloadUrl } from '../services/api';
 
 // Pipeline steps with their sub-tasks (some sub-tasks are expandable to show files/details)
 const PIPELINE_STEPS = [
@@ -125,13 +125,24 @@ const StatusBadge = ({ status }) => {
 };
 
 // Report File Link Component
-const ReportLink = ({ filename }) => {
+const ReportLink = ({ filename, reportKey, folderName, onDownload }) => {
   if (!filename) return null;
+
+  const handleClick = async (e) => {
+    e.stopPropagation();
+    if (onDownload) {
+      onDownload(filename, reportKey, folderName);
+    }
+  };
+
   return (
-    <span style={{
-      display: 'inline-flex', alignItems: 'center', gap: '4px',
-      color: COLORS.primary, fontSize: '13px', cursor: 'pointer'
-    }}>
+    <span
+      onClick={handleClick}
+      style={{
+        display: 'inline-flex', alignItems: 'center', gap: '4px',
+        color: COLORS.primary, fontSize: '13px', cursor: 'pointer'
+      }}
+    >
       <span>📄</span>
       <span style={{ textDecoration: 'underline' }}>{filename}</span>
     </span>
@@ -199,7 +210,7 @@ const FileList = ({ files, label }) => {
 };
 
 // Sub-Task Component (now expandable)
-const SubTask = ({ subTask, subTaskData, stepNumber, subIndex, onToggleExpand }) => {
+const SubTask = ({ subTask, subTaskData, stepNumber, subIndex, onToggleExpand, onDownloadReport, folderName }) => {
   const status = subTaskData?.status || 'pending';
   const duration = subTaskData?.duration;
   const progress = subTaskData?.progress;
@@ -281,7 +292,13 @@ const SubTask = ({ subTask, subTaskData, stepNumber, subIndex, onToggleExpand })
               {formatDuration(duration)}
             </span>
           )}
-          {subTask.reportFile && <ReportLink filename={subTask.reportFile} />}
+          {subTask.reportFile && (
+            <ReportLink
+              filename={subTask.reportFile}
+              folderName={folderName}
+              onDownload={onDownloadReport}
+            />
+          )}
           <StatusBadge status={status} />
         </div>
       </div>
@@ -290,7 +307,7 @@ const SubTask = ({ subTask, subTaskData, stepNumber, subIndex, onToggleExpand })
 };
 
 // Step Card Component
-const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle, onToggleSubTask }) => {
+const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle, onToggleSubTask, onDownloadReport, folderName }) => {
   const status = stepData?.status || 'pending';
   const duration = stepData?.duration;
   const subTasks = stepData?.subTasks || {};
@@ -351,7 +368,13 @@ const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle, onToggleSu
               {formatDuration(duration)}
             </span>
           )}
-          {step.reportFile && <ReportLink filename={step.reportFile} />}
+          {step.reportFile && (
+            <ReportLink
+              filename={step.reportFile}
+              folderName={folderName}
+              onDownload={onDownloadReport}
+            />
+          )}
           <StatusBadge status={status === 'completed' ? 'pass' : status} />
         </div>
       </div>
@@ -367,6 +390,8 @@ const StepCard = ({ step, stepNumber, stepData, isExpanded, onToggle, onToggleSu
               stepNumber={stepNumber}
               subIndex={idx}
               onToggleExpand={() => onToggleSubTask(step.id, subTask.id)}
+              onDownloadReport={onDownloadReport}
+              folderName={folderName}
             />
           ))}
         </div>
@@ -520,12 +545,19 @@ function PipelineInterface() {
 
     try {
       const status = await getPipelineStatus(currentExecutionId);
+
+      // Debug logging
+      console.log('=== Pipeline Status Response ===');
+      console.log('status.status:', status.status);
+      console.log('status.current_step:', status.current_step);
+      console.log('status.completed_states:', status.completed_states);
+      console.log('step_details keys:', Object.keys(status.step_details || {}));
+
       const currentStepId = mapStateToStepId(status.current_step);
 
       // Get the step_details which contains all the detailed results
-      const stepDetails = status.step_details || {};
-      // The data is nested under the current step key (e.g., CheckProcedureStatus)
-      const detailsData = stepDetails[status.current_step] || stepDetails[Object.keys(stepDetails)[0]] || {};
+      // step_details is the accumulated state with all results (sftpDownloadResult, validationResult, etc.)
+      const detailsData = status.step_details || {};
 
       setProcessInfo({
         id: currentExecutionId.split(':').pop()?.slice(0, 15),
@@ -544,6 +576,21 @@ function PipelineInterface() {
         return prevData[stepId]?.subTasks?.[subTaskId]?.isExpanded || false;
       };
 
+      // Track which steps have completed based on completed_states from API
+      const completedStates = new Set(status.completed_states || []);
+      const isSftpDone = completedStates.has('SftpDownload');
+      // eslint-disable-next-line no-unused-vars
+      const isFolderDone = completedStates.has('CreateTimestampedFolder');
+      const isValidationDone = completedStates.has('RunValidation');
+      const isSqlLoadDone = completedStates.has('SqlLoad');
+      const isProcStartDone = completedStates.has('StartStoredProcedure');
+      // eslint-disable-next-line no-unused-vars
+      const isProcStatusDone = completedStates.has('CheckProcedureStatus');
+      const isExportDone = completedStates.has('ExportDeltaFiles');
+      const isUploadDone = completedStates.has('SftpUpload');
+      const isReportDone = completedStates.has('GenerateFinalReport');
+      const isPipelineSuccess = status.status === 'SUCCEEDED';
+
       // Extract SFTP Download results
       const sftpResult = detailsData.sftpDownloadResult;
       if (sftpResult) {
@@ -551,17 +598,23 @@ function PipelineInterface() {
           ? Math.round((new Date(sftpResult.completed_at) - new Date(sftpResult.started_at)) / 1000)
           : 0;
 
+        // Substeps update progressively based on actual progress
+        const hasConnected = sftpResult.connected || sftpResult.success;
+        const filesFound = sftpResult.total_files || sftpResult.files_downloaded || 0;
+        const filesDownloaded = sftpResult.files_downloaded || 0;
+
         newStepData.sftp_download = {
-          status: sftpResult.success ? 'pass' : 'fail',
+          status: isSftpDone ? (sftpResult.success ? 'pass' : 'fail') : 'in progress',
           duration: downloadDuration,
+          folderName: detailsData.folderResult?.folder_name,
           subTasks: {
             connect: {
-              status: sftpResult.connected ? 'pass' : (sftpResult.success ? 'pass' : 'fail'),
-              duration: 2
+              status: hasConnected ? 'pass' : (status.current_step === 'SftpDownload' ? 'in progress' : 'pending'),
+              duration: hasConnected ? 2 : undefined
             },
             discover: {
-              status: sftpResult.total_files > 0 ? 'pass' : 'pending',
-              count: sftpResult.total_files || sftpResult.files_downloaded || 0,
+              status: filesFound > 0 ? 'pass' : (hasConnected && status.current_step === 'SftpDownload' ? 'in progress' : 'pending'),
+              count: filesFound,
               files: (sftpResult.file_results || []).map(f => ({
                 name: f.filename,
                 size: formatBytes(f.source_size),
@@ -570,9 +623,9 @@ function PipelineInterface() {
               isExpanded: getExpandedState('sftp_download', 'discover')
             },
             download: {
-              status: sftpResult.files_downloaded > 0 ? 'pass' : 'pending',
-              count: sftpResult.files_downloaded || 0,
-              progress: sftpResult.files_downloaded > 0 ? 100 : 0,
+              status: filesDownloaded > 0 ? 'pass' : (filesFound > 0 ? 'in progress' : 'pending'),
+              count: filesDownloaded,
+              progress: filesDownloaded > 0 ? 100 : (filesFound > 0 ? 50 : 0),
               totalBytes: sftpResult.total_bytes || 0,
               files: (sftpResult.file_results || []).filter(f => f.success).map(f => ({
                 name: f.filename,
@@ -583,16 +636,17 @@ function PipelineInterface() {
             }
           }
         };
-      }
-
-      // Extract Folder creation results (part of step 1 - Download)
-      const folderResult = detailsData.folderResult;
-      if (folderResult && folderResult.success) {
-        // Keep sftp_download as pass if folder creation succeeded
-        if (newStepData.sftp_download) {
-          newStepData.sftp_download.folderName = folderResult.folder_name;
-          newStepData.sftp_download.filesMoved = folderResult.files_moved;
-        }
+      } else if (status.current_step === 'SftpDownload') {
+        // SFTP in progress but no results yet
+        newStepData.sftp_download = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            connect: { status: 'in progress' },
+            discover: { status: 'pending', count: 0, files: [], isExpanded: false },
+            download: { status: 'pending', count: 0, progress: 0, files: [], isExpanded: false }
+          }
+        };
       }
 
       // Extract Validation results
@@ -600,27 +654,39 @@ function PipelineInterface() {
       if (validationResult) {
         // Count valid files for display
         const validFileCount = validationResult.valid_files?.length || 0;
+        const dupCheck = validationResult.duplicate_check || {};
+        const compCheck = validationResult.completeness_check || {};
+        const nameCheck = validationResult.name_validation || {};
 
         newStepData.validation = {
-          status: validationResult.validation_passed ? 'pass' : (validationResult.has_critical_errors ? 'fail' : 'pass'),
+          status: isValidationDone ? (validationResult.validation_passed ? 'pass' : (validationResult.has_critical_errors ? 'fail' : 'pass')) : 'in progress',
           duration: 0,
           subTasks: {
             duplicates: {
-              status: validationResult.duplicate_check?.success ? 'pass' :
-                      (validationResult.duplicate_check?.error ? 'warning' : 'pass'),
-              count: validationResult.duplicate_check?.duplicate_count || 0,
-              message: validationResult.duplicate_check?.error || `${validFileCount} files validated`,
+              status: dupCheck.success !== undefined ? (dupCheck.success ? 'pass' : 'fail') : (isValidationDone ? 'skipped' : 'pending'),
+              count: dupCheck.duplicate_count || 0,
+              message: dupCheck.error || (dupCheck.success ? `${validFileCount} files validated` : 'Checking...'),
               isExpanded: getExpandedState('validation', 'duplicates')
             },
             completeness: {
-              status: validationResult.completeness_check?.success ? 'pass' : 'warning',
+              status: compCheck.success !== undefined ? (compCheck.success ? 'pass' : 'fail') : (isValidationDone ? 'skipped' : 'pending'),
               progress: 100,
-              message: `${validFileCount} files complete`
+              message: compCheck.success ? `${validFileCount} files complete` : (compCheck.error || 'Checking...')
             },
             filename: {
-              status: validationResult.name_validation?.success ? 'pass' : 'warning',
-              message: validationResult.name_validation?.error || 'File names validated'
+              status: nameCheck.success !== undefined ? (nameCheck.success ? 'pass' : 'fail') : (isValidationDone ? 'skipped' : 'pending'),
+              message: nameCheck.error || (nameCheck.success ? 'File names validated' : 'Checking...')
             }
+          }
+        };
+      } else if (status.current_step === 'RunValidation') {
+        newStepData.validation = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            duplicates: { status: 'in progress', count: 0, message: 'Checking duplicates...', isExpanded: false },
+            completeness: { status: 'pending', progress: 0, message: 'Waiting...' },
+            filename: { status: 'pending', message: 'Waiting...' }
           }
         };
       }
@@ -634,7 +700,7 @@ function PipelineInterface() {
         const haciendaFiles = loadResults.filter(f => !f.filename?.toLowerCase().includes('rhum'));
 
         newStepData.sql_load = {
-          status: sqlLoadResult.success ? 'pass' : (sqlLoadResult.files_processed > 0 ? 'warning' : 'fail'),
+          status: isSqlLoadDone ? (sqlLoadResult.success ? 'pass' : 'fail') : 'in progress',
           duration: 0,
           filesProcessed: sqlLoadResult.files_processed || 0,
           filesLoaded: sqlLoadResult.files_loaded || 0,
@@ -642,7 +708,7 @@ function PipelineInterface() {
           reportKey: sqlLoadResult.report_key,
           subTasks: {
             rhum: {
-              status: rhumFiles.length > 0 ? 'pass' : 'pending',
+              status: rhumFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
               count: rhumFiles.length,
               files: rhumFiles.map(f => ({
                 name: f.filename,
@@ -651,7 +717,7 @@ function PipelineInterface() {
               isExpanded: getExpandedState('sql_load', 'rhum')
             },
             hacienda: {
-              status: haciendaFiles.length > 0 ? 'pass' : 'pending',
+              status: haciendaFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
               count: haciendaFiles.length,
               files: haciendaFiles.map(f => ({
                 name: f.filename,
@@ -661,13 +727,23 @@ function PipelineInterface() {
             }
           }
         };
+      } else if (status.current_step === 'SqlLoad') {
+        newStepData.sql_load = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            rhum: { status: 'in progress', count: 0, files: [], isExpanded: false },
+            hacienda: { status: 'pending', count: 0, files: [], isExpanded: false }
+          }
+        };
       }
 
       // Extract Stored Procedure results
       const procStartResult = detailsData.procStartResult;
       const procStatus = detailsData.procStatus;
       if (procStartResult || procStatus) {
-        const isRunning = procStatus && !procStatus.is_completed;
+        const isRunning = procStatus && !procStatus.is_completed && procStatus.status !== 'error';
+        const isCompleted = procStatus?.is_completed || false;
         const startTime = procStartResult?.timestamp ? new Date(procStartResult.timestamp) : null;
         const procDuration = startTime ? Math.round((new Date() - startTime) / 1000) : 0;
 
@@ -682,38 +758,127 @@ function PipelineInterface() {
           count: count
         }));
 
+        // Determine substep statuses progressively
+        const personStatus = isProcStartDone ? 'pass' : (procStartResult ? 'in progress' : 'pending');
+        const businessStatus = isCompleted ? 'pass' : (isRunning ? 'in progress' : 'pending');
+        const summaryStatus = isCompleted ? 'pass' : 'pending';
+
         newStepData.stored_procedure = {
-          status: procStatus?.is_completed ? 'pass' : (isRunning ? 'in progress' : 'pending'),
+          status: isCompleted ? 'pass' : (isRunning || isProcStartDone ? 'in progress' : 'pending'),
           duration: procDuration,
           currentStep: procStatus?.current_step || procStatus?.status || 'running',
           deltaCounts: deltaCounts,
           totalDeltas: totalDeltas,
           subTasks: {
             person: {
-              status: isRunning || procStatus?.is_completed ? 'pass' : 'in progress',
-              message: `Processing records...`
+              status: personStatus,
+              message: personStatus === 'pass' ? 'PERSON hierarchy updated' : 'Processing records...'
             },
             business: {
-              status: isRunning ? 'in progress' : 'pending',
-              message: totalDeltas > 0 ? `${totalDeltas} delta records generated` : 'Validating...',
+              status: businessStatus,
+              message: totalDeltas > 0 ? `${totalDeltas} delta records generated` : (isRunning ? 'Validating business rules...' : 'Waiting...'),
               count: totalDeltas,
               files: deltaFiles,
               isExpanded: getExpandedState('stored_procedure', 'business')
             },
             summary: {
-              status: procStatus?.is_completed ? 'pass' : 'pending',
-              message: procStatus?.is_completed ? 'Summary tables generated' : 'Waiting...'
+              status: summaryStatus,
+              message: isCompleted ? 'Summary tables generated' : 'Waiting...'
             }
+          }
+        };
+      } else if (['StartStoredProcedure', 'WaitForProcedure', 'CheckProcedureStatus'].includes(status.current_step)) {
+        newStepData.stored_procedure = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            person: { status: 'in progress', message: 'Starting procedure...' },
+            business: { status: 'pending', message: 'Waiting...', count: 0, files: [], isExpanded: false },
+            summary: { status: 'pending', message: 'Waiting...' }
           }
         };
       }
 
-      // Update current step to 'in progress' if running
+      // Extract Delta Export results
+      const exportResult = detailsData.exportResult;
+      if (exportResult) {
+        const exportedFiles = exportResult.exported_files || [];
+        const rhumExports = exportedFiles.filter(f => f.toLowerCase().includes('rhum'));
+        const haciendaExports = exportedFiles.filter(f => !f.toLowerCase().includes('rhum'));
+
+        newStepData.delta_export = {
+          status: isExportDone ? (exportResult.success ? 'pass' : 'fail') : 'in progress',
+          duration: 0,
+          outputPrefix: exportResult.output_prefix,
+          subTasks: {
+            rhum: {
+              status: rhumExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
+              count: rhumExports.length,
+              files: rhumExports.map(f => ({ name: f.split('/').pop(), status: 'completed' })),
+              isExpanded: getExpandedState('delta_export', 'rhum')
+            },
+            hacienda: {
+              status: haciendaExports.length > 0 ? 'pass' : (isExportDone ? 'skipped' : 'pending'),
+              count: haciendaExports.length,
+              files: haciendaExports.map(f => ({ name: f.split('/').pop(), status: 'completed' })),
+              isExpanded: getExpandedState('delta_export', 'hacienda')
+            }
+          }
+        };
+      } else if (status.current_step === 'ExportDeltaFiles') {
+        newStepData.delta_export = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            rhum: { status: 'in progress', count: 0, files: [], isExpanded: false },
+            hacienda: { status: 'pending', count: 0, files: [], isExpanded: false }
+          }
+        };
+      }
+
+      // Extract SFTP Upload results (part of delta export for display)
+      const uploadResult = detailsData.uploadResult;
+      if (uploadResult && newStepData.delta_export) {
+        newStepData.delta_export.uploadResult = uploadResult;
+        // Update status if upload completed
+        if (isUploadDone) {
+          newStepData.delta_export.status = uploadResult.success ? 'pass' : 'fail';
+        }
+      }
+
+      // Extract Final Report results
+      const finalReport = detailsData.finalReport;
+      if (finalReport || isPipelineSuccess) {
+        newStepData.generate_report = {
+          status: isReportDone || isPipelineSuccess ? 'pass' : 'in progress',
+          duration: 0,
+          reportKey: finalReport?.report_key,
+          subTasks: {
+            collect: {
+              status: isPipelineSuccess ? 'pass' : 'in progress',
+              message: 'Statistics collected'
+            },
+            generate: {
+              status: isPipelineSuccess ? 'pass' : 'pending',
+              message: isPipelineSuccess ? 'Summary generated' : 'Generating...'
+            }
+          }
+        };
+      } else if (status.current_step === 'GenerateFinalReport') {
+        newStepData.generate_report = {
+          status: 'in progress',
+          duration: 0,
+          subTasks: {
+            collect: { status: 'in progress', message: 'Collecting statistics...' },
+            generate: { status: 'pending', message: 'Waiting...' }
+          }
+        };
+      }
+
+      // Update current step to 'in progress' if running and no data exists
       if (currentStepId && status.status === 'RUNNING') {
         if (!newStepData[currentStepId]) {
           newStepData[currentStepId] = { status: 'in progress', duration: 0, subTasks: {} };
-        } else {
-          newStepData[currentStepId] = { ...newStepData[currentStepId], status: 'in progress' };
         }
         setExpandedSteps(prev => ({ ...prev, [currentStepId]: true }));
       }
@@ -721,6 +886,15 @@ function PipelineInterface() {
       // Store in ref and update state
       stepDataRef.current = newStepData;
       setStepData(newStepData);
+
+      // Debug: log what step data was calculated
+      console.log('=== Calculated Step Data ===');
+      console.log('sftp_download status:', newStepData.sftp_download?.status);
+      console.log('validation status:', newStepData.validation?.status);
+      console.log('sql_load status:', newStepData.sql_load?.status);
+      console.log('stored_procedure status:', newStepData.stored_procedure?.status);
+      console.log('delta_export status:', newStepData.delta_export?.status);
+      console.log('generate_report status:', newStepData.generate_report?.status);
 
       // Calculate progress based on completed steps
       let completedCount = 0;
@@ -749,6 +923,51 @@ function PipelineInterface() {
     setIsRunning(false);
     if (timerRef.current) { clearInterval(timerRef.current); timerRef.current = null; }
     if (pollingRef.current) { clearInterval(pollingRef.current); pollingRef.current = null; }
+  };
+
+  // Get the folder name from step data for report paths
+  const getFolderName = () => {
+    return stepData.sftp_download?.folderName || '';
+  };
+
+  // Handle report download
+  const handleDownloadReport = async (filename, reportKey, folderName) => {
+    try {
+      // Construct the S3 key for the report
+      // Reports are stored in the folder's reports directory
+      const folder = folderName || getFolderName();
+      if (!folder) {
+        alert('Pipeline folder not available. Please wait for the download step to complete.');
+        return;
+      }
+
+      // Map filenames to their S3 paths
+      const reportPaths = {
+        'Downloaded Files.txt': `${folder}/reports/Downloaded Files.txt`,
+        'Duplicate-Obsolete Validation.txt': `${folder}/reports/Duplicate-Obsolete Validation.txt`,
+        'Completeness Validation.txt': `${folder}/reports/Completeness Validation.txt`,
+        'File Name Validation.txt': `${folder}/reports/File Name Validation.txt`,
+        'Load Database Report.txt': `${folder}/reports/Load Database Report.txt`,
+        'Process Data Report.txt': `${folder}/reports/Process Data Report.txt`,
+        'Generate Files Report.txt': `${folder}/reports/Generate Files Report.txt`,
+        'Pipeline Report.txt': `${folder}/reports/Pipeline Report.txt`
+      };
+
+      const s3Key = reportKey || reportPaths[filename] || `${folder}/reports/${filename}`;
+
+      // Get pre-signed URL for download
+      const response = await getReportDownloadUrl(s3Key);
+
+      if (response.url) {
+        // Open the download URL in a new tab
+        window.open(response.url, '_blank');
+      } else if (response.error) {
+        alert(`Report not available: ${response.error}`);
+      }
+    } catch (err) {
+      console.error('Error downloading report:', err);
+      alert(`Failed to download report: ${err.message}`);
+    }
   };
 
   const handleStartPipeline = async () => {
@@ -955,6 +1174,8 @@ function PipelineInterface() {
                   isExpanded={expandedSteps[step.id] || false}
                   onToggle={() => toggleStep(step.id)}
                   onToggleSubTask={toggleSubTask}
+                  onDownloadReport={handleDownloadReport}
+                  folderName={getFolderName()}
                 />
               ))}
             </div>
