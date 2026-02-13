@@ -28,8 +28,15 @@ const PIPELINE_STEPS = [
     label: 'Load to Database',
     reportFile: 'Load Database Report.txt',
     subTasks: [
-      { id: 'rhum', label: 'RHUM Tables', expandable: true, expandLabel: 'tables' },
-      { id: 'hacienda', label: 'HACIENDA Tables', expandable: true, expandLabel: 'tables' }
+      { id: 'rhum', label: 'RHUM Tables (8)', expandable: true, expandLabel: 'tables' },
+      { id: 'hacienda', label: 'HACIENDA Tables (8)', expandable: true, expandLabel: 'tables' },
+      { id: '911', label: '911 Tables (7)', expandable: true, expandLabel: 'tables' },
+      { id: 'fimas', label: 'FIMAS Tables (8)', expandable: true, expandLabel: 'tables' },
+      { id: 'kronospol', label: 'KRONOSPOL Tables (8)', expandable: true, expandLabel: 'tables' },
+      { id: 'doe', label: 'DOE Tables (6)', expandable: true, expandLabel: 'tables' },
+      { id: 'adppolicia', label: 'ADPPOLICIA Tables (1)', expandable: true, expandLabel: 'tables' },
+      { id: 'kronosde', label: 'KRONOSDE Tables (1)', expandable: true, expandLabel: 'tables' },
+      { id: 'sepi', label: 'SEPI Tables (1)', expandable: true, expandLabel: 'tables' }
     ]
   },
   {
@@ -475,8 +482,21 @@ function PipelineInterface() {
   const loadHistoryList = async () => {
     setLoadingHistory(true);
     try {
-      const executions = await listPipelineExecutions(20);
-      setHistoryList(executions.executions || []);
+      const data = await listPipelineExecutions(20);
+      const executions = (data.executions || []).map(exec => ({
+        // Normalize field names (support both old and new API format)
+        executionId: exec.executionId || exec.execution_id,
+        id: exec.id || exec.name,
+        name: exec.name,
+        status: exec.status,
+        startDate: exec.startDate || exec.started_at,
+        stopDate: exec.stopDate || exec.stopped_at,
+        duration: exec.duration != null ? exec.duration :
+          (exec.stopDate || exec.stopped_at) && (exec.startDate || exec.started_at)
+            ? (new Date(exec.stopDate || exec.stopped_at) - new Date(exec.startDate || exec.started_at)) / 1000
+            : null
+      }));
+      setHistoryList(executions);
     } catch (err) {
       console.error('Failed to load history:', err);
     }
@@ -694,15 +714,59 @@ function PipelineInterface() {
       // Extract SQL Load results
       const sqlLoadResult = detailsData.sqlLoadResult;
       if (sqlLoadResult || isSqlLoadDone) {
-        // Separate files by source (RHUM vs HACIENDA/FIMAS)
+        // Categorize files by source system
         const loadResults = sqlLoadResult?.load_results || [];
-        const rhumFiles = loadResults.filter(f => f.filename?.toLowerCase().includes('rhum'));
-        const haciendaFiles = loadResults.filter(f => !f.filename?.toLowerCase().includes('rhum'));
+        const sourceKeys = ['rhum', 'hacienda', '911', 'fimas', 'kronospol', 'doe', 'adppolicia', 'kronosde', 'sepi'];
+        const sourcePatterns = {
+          rhum: f => /rhum/i.test(f.filename || ''),
+          hacienda: f => /hac88|hacienda/i.test(f.filename || ''),
+          '911': f => /_911_/i.test(f.filename || ''),
+          fimas: f => /fimas/i.test(f.filename || ''),
+          kronospol: f => /kronospol/i.test(f.filename || ''),
+          doe: f => /_doe_/i.test(f.filename || ''),
+          adppolicia: f => /adppolicia/i.test(f.filename || ''),
+          kronosde: f => /kronosde/i.test(f.filename || ''),
+          sepi: f => /sepi/i.test(f.filename || '')
+        };
+
+        // Group files by source
+        const sourceFiles = {};
+        sourceKeys.forEach(key => { sourceFiles[key] = []; });
+        loadResults.forEach(f => {
+          let matched = false;
+          for (const key of sourceKeys) {
+            if (sourcePatterns[key](f)) {
+              sourceFiles[key].push(f);
+              matched = true;
+              break;
+            }
+          }
+          if (!matched) {
+            // Unmatched files go to hacienda as fallback
+            sourceFiles.hacienda.push(f);
+          }
+        });
 
         // Determine success: explicit success property, or infer from tables_created/files_loaded
         const tablesLoaded = sqlLoadResult?.tables_created || sqlLoadResult?.files_loaded || 0;
         const hasExplicitSuccess = sqlLoadResult?.success !== undefined;
         const isSuccess = hasExplicitSuccess ? sqlLoadResult.success : (tablesLoaded > 0 || isSqlLoadDone);
+
+        // Build subTasks for each source
+        const subTasks = {};
+        sourceKeys.forEach(key => {
+          const files = sourceFiles[key];
+          subTasks[key] = {
+            status: files.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
+            count: files.length,
+            message: files.length > 0 ? `${files.length} tables` : undefined,
+            files: files.map(f => ({
+              name: f.filename,
+              status: f.success ? 'completed' : 'failed'
+            })),
+            isExpanded: getExpandedState('sql_load', key)
+          };
+        });
 
         newStepData.sql_load = {
           status: isSqlLoadDone ? (isSuccess ? 'pass' : 'fail') : 'in progress',
@@ -711,37 +775,17 @@ function PipelineInterface() {
           filesLoaded: sqlLoadResult?.files_loaded || tablesLoaded,
           totalRows: sqlLoadResult?.total_rows || 0,
           reportKey: sqlLoadResult?.report_key,
-          subTasks: {
-            rhum: {
-              status: rhumFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
-              count: rhumFiles.length,
-              message: rhumFiles.length > 0 ? `${rhumFiles.length} tables` : undefined,
-              files: rhumFiles.map(f => ({
-                name: f.filename,
-                status: f.success ? 'completed' : 'failed'
-              })),
-              isExpanded: getExpandedState('sql_load', 'rhum')
-            },
-            hacienda: {
-              status: haciendaFiles.length > 0 ? 'pass' : (isSqlLoadDone ? 'skipped' : 'pending'),
-              count: haciendaFiles.length,
-              message: haciendaFiles.length > 0 ? `${haciendaFiles.length} tables` : undefined,
-              files: haciendaFiles.map(f => ({
-                name: f.filename,
-                status: f.success ? 'completed' : 'failed'
-              })),
-              isExpanded: getExpandedState('sql_load', 'hacienda')
-            }
-          }
+          subTasks
         };
       } else if (status.current_step === 'SqlLoad') {
+        const subTasks = {};
+        ['rhum', 'hacienda', '911', 'fimas', 'kronospol', 'doe', 'adppolicia', 'kronosde', 'sepi'].forEach((key, idx) => {
+          subTasks[key] = { status: idx === 0 ? 'in progress' : 'pending', count: 0, files: [], isExpanded: false };
+        });
         newStepData.sql_load = {
           status: 'in progress',
           duration: 0,
-          subTasks: {
-            rhum: { status: 'in progress', count: 0, files: [], isExpanded: false },
-            hacienda: { status: 'pending', count: 0, files: [], isExpanded: false }
-          }
+          subTasks
         };
       }
 
